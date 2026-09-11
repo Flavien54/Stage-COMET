@@ -1,305 +1,227 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-roughness_viewer.py
-====================
-Lit une carte de HAUTEURS BRUTES (topographie Z) au format TIFF
-(ex: EchantillonCM-11-surface_alignedMap.tiff), l'affiche avec une mise en page
-proche des logiciels de métrologie 3D (fond noir, colormap type "jet", panneau
-d'infos en haut à gauche, échelle colorée horizontale en bas), puis exporte le
-rendu en image haute résolution.
-
-Le script est générique : il fonctionne aussi bien pour une carte de hauteurs (Z,
-en mm) que pour une carte de rugosité ou toute autre grandeur scalaire 2D — il
-suffit d'adapter --label et --unit.
-
-Dépendances :
-    pip install tifffile numpy matplotlib scipy --break-system-packages
-
-Utilisation :
-    python3 roughness_viewer.py --input EchantillonCM-11-surface_alignedMap.tiff
-
-Options utiles (voir --help) :
-    --label           nom de la grandeur affichée dans la légende (défaut: "Height")
-    --unit            unité affichée dans la légende (défaut: "mm")
-    --pixel-size-mm   taille d'un pixel en mm (pour calculer les dimensions XY affichées)
-    --vmin / --vmax   bornes de l'échelle de couleur. Par défaut = min/max des données
-    --object-threshold  seuil (valeur absolue, même unité que les données) utilisé pour
-                        compter les "objets" (pics/creux isolés), affiché comme "Object Count"
-    --output          chemin du fichier image exporté (.png par défaut)
-    --export-data     exporte aussi les données brutes en .csv
-"""
-
-from __future__ import annotations
-
-import argparse
-import glob
-import os
-import sys
-from datetime import datetime
-from scipy import ndimage
-import numpy as np
 import matplotlib
+matplotlib.use("TkAgg")
 
-matplotlib.use("Agg")  # rendu sans interface graphique (export direct en fichier)
+import tkinter as tk
+from tkinter import filedialog
+
+import numpy as np
+import tifffile
+
 import matplotlib.pyplot as plt
-from matplotlib import cm
-from matplotlib.colors import Normalize
+from matplotlib.gridspec import GridSpec
 
-try:
-    import tifffile
-except ImportError:
-    sys.exit("Le module 'tifffile' est requis : pip install tifffile --break-system-packages")
+from scipy.ndimage import zoom
 
 
-# --------------------------------------------------------------------------- #
-# 0. Sélection du fichier d'entrée (sans avoir à taper de commande)
-# --------------------------------------------------------------------------- #
-def resolve_input_path(cli_input: str | None) -> str:
-    """Détermine le fichier TIFF à ouvrir, sans obliger l'utilisateur à taper
-    une commande dans la console :
+# ==================================================
+# Sélection fichier TIFF
+# ==================================================
 
-    1) Si --input a été fourni explicitement -> on l'utilise tel quel.
-    2) Sinon, si un seul fichier .tif/.tiff se trouve dans le dossier du script
-       -> on le sélectionne automatiquement (cas le plus courant : le script est
-       placé à côté de l'image à analyser).
-    3) Sinon (aucun ou plusieurs fichiers trouvés) -> une fenêtre Windows
-       s'ouvre pour choisir le fichier à la souris.
-    """
-    if cli_input:
-        return cli_input
+root = tk.Tk()
+root.withdraw()
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    tiffs = sorted(
-        glob.glob(os.path.join(script_dir, "*.tif"))
-        + glob.glob(os.path.join(script_dir, "*.tiff"))
-    )
-    if len(tiffs) == 1:
-        print(f"Aucun --input fourni : fichier détecté automatiquement -> {tiffs[0]}")
-        return tiffs[0]
+filename = filedialog.askopenfilename(
+    title="Sélectionner la carte surface TIFF",
+    filetypes=[("TIFF files", "*.tif *.tiff")]
+)
 
-    # Plusieurs fichiers, ou aucun -> on ouvre une fenêtre de sélection
+if filename == "":
+    print("Aucun fichier sélectionné")
+    exit()
+
+print("Fichier chargé :")
+print(filename)
+
+
+# ==================================================
+# Lecture TIFF
+# ==================================================
+
+img = tifffile.imread(filename)
+
+print("\nInformations TIFF")
+print("----------------")
+print("Dimensions :", img.shape)
+print("Type :", img.dtype)
+print("Min brut :", np.nanmin(img))
+print("Max brut :", np.nanmax(img))
+
+if img.ndim == 3:
+    print("Stack 3D détecté -> slice 0")
+    img = img[0]
+
+img = img.astype(float)
+
+# Conversion m -> mm
+img = img * 1e3
+
+print("\nAprès conversion mm")
+print("-------------------")
+print("Min :", np.nanmin(img), "mm")
+print("Max :", np.nanmax(img), "mm")
+
+# Gestion NaN
+if np.isnan(img).any():
+    print("NaN détectés")
+    img[np.isnan(img)] = np.nanmean(img)
+
+# Sur-échantillonnage
+scale = 4
+img = zoom(img, zoom=scale, order=3)
+print("Nouvelle résolution :", img.shape)
+
+
+# ==================================================
+# Dimensions physiques
+# ==================================================
+
+width_mm = 34.96
+height_mm = 23.57
+
+
+# ==================================================
+# Echelle couleur
+# ==================================================
+
+vmin = -0.08
+vmax = 0.04
+
+if np.nanmin(img) > vmin or np.nanmax(img) < vmax:
+    vmin = np.nanmin(img)
+    vmax = np.nanmax(img)
+
+
+# ==================================================
+# Figure
+# ==================================================
+
+plt.style.use("dark_background")
+
+# Fenêtre plus grande
+fig = plt.figure(figsize=(20, 9), dpi=110)
+fig.patch.set_facecolor("black")
+
+# Layout :
+#   - Colonne gauche : infos
+#   - Colonne droite : carte + colorbar horizontale en bas
+gs = GridSpec(
+    2, 2,
+    figure=fig,
+    width_ratios=[0.13, 1.0],
+    height_ratios=[1.0, 0.06],
+    wspace=0.02,
+    hspace=0.25,
+    left=0.02, right=0.98,
+    top=0.94, bottom=0.10
+)
+
+
+# --------------------------------------------------
+# Panneau d'information (gauche, sur les 2 lignes)
+# --------------------------------------------------
+ax_info = fig.add_subplot(gs[:, 0])
+ax_info.axis("off")
+
+info = (
+    f"{width_mm:.2f} × {height_mm:.2f} mm\n\n"
+    f"Range  Min: {np.nanmin(img):.2f}  Max: {np.nanmax(img):.2f} mm\n\n"
+    f"Slice 1 / 1\n\n\n"
+    f"Yaw:   90.0 °\n\n"
+    f"Pitch: 90.0 °\n\n"
+    f"Roll:  91.2 °"
+)
+
+ax_info.text(
+    0.0, 1.0, info,
+    fontsize=13,
+    color="#4fc3f7",
+    verticalalignment="top",
+    horizontalalignment="left",
+    family="sans-serif",
+    transform=ax_info.transAxes
+)
+
+
+# --------------------------------------------------
+# Carte principale (haut droite) — large
+# --------------------------------------------------
+ax = fig.add_subplot(gs[0, 1])
+
+im = ax.imshow(
+    img,
+    cmap="jet",
+    origin="lower",
+    extent=[0, width_mm, 0, height_mm],
+    interpolation="bicubic",
+    vmin=vmin,
+    vmax=vmax,
+    aspect="auto"          # étire pour remplir toute la largeur
+)
+
+ax.set_xlim(0, width_mm)
+ax.set_ylim(0, height_mm)
+
+ax.set_xlabel("Y (mm)", fontsize=12)
+ax.set_ylabel("Z (mm)", fontsize=12)
+ax.set_title("EchantillonCM-11 - Surface aligned map", fontsize=15, pad=8)
+
+# Couleurs des ticks
+ax.tick_params(colors="white", labelsize=11)
+
+
+# --------------------------------------------------
+# Colorbar horizontale (bas droite)
+# --------------------------------------------------
+ax_cbar = fig.add_subplot(gs[1, 1])
+
+cbar = fig.colorbar(
+    im,
+    cax=ax_cbar,
+    orientation="horizontal"
+)
+
+cbar.set_label("Aligned (mm)", fontsize=12, color="white")
+cbar.ax.tick_params(colors="white", labelsize=11)
+cbar.outline.set_edgecolor("white")
+
+
+# --------------------------------------------------
+# Petite annotation "Object Count" en bas à gauche
+# --------------------------------------------------
+fig.text(
+    0.02, 0.02,
+    "Object Count: 194",
+    fontsize=12,
+    color="#4fc3f7",
+    ha="left", va="bottom"
+)
+
+
+# ==================================================
+# Toolbar : coordonnées en mm
+# ==================================================
+
+def format_coord(x, y):
     try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        path = filedialog.askopenfilename(
-            title="Choisir le fichier TIFF à analyser",
-            initialdir=script_dir,
-            filetypes=[("Images TIFF", "*.tif *.tiff"), ("Tous les fichiers", "*.*")],
-        )
-        root.destroy()
-        if path:
-            return path
+        col = int((x / width_mm) * img.shape[1])
+        row = int((y / height_mm) * img.shape[0])
+        if 0 <= row < img.shape[0] and 0 <= col < img.shape[1]:
+            value = img[row, col]
+            return (
+                f"X={x:.3f} mm   "
+                f"Y={y:.3f} mm   "
+                f"Z={value:.5f} mm"
+            )
     except Exception:
-        pass  # pas d'environnement graphique disponible -> on retombe sur l'erreur ci-dessous
-
-    sys.exit(
-        "Aucun fichier sélectionné. Relancez et choisissez un fichier dans la fenêtre, "
-        "ou passez --input \"chemin\\vers\\fichier.tiff\"."
-    )
+        pass
+    return f"X={x:.3f} mm   Y={y:.3f} mm"
 
 
-# --------------------------------------------------------------------------- #
-# 1. Lecture du fichier TIFF
-# --------------------------------------------------------------------------- #
-def load_roughness_map(path: str) -> np.ndarray:
-    """Charge la carte de rugosité et la renvoie en tableau 2D float (mm).
-
-    Gère les cas où le TIFF contient plusieurs canaux, plusieurs pages (slices),
-    ou des valeurs stockées comme entiers (auquel cas on les convertit en float).
-    """
-    data = tifffile.imread(path)
-
-    # Si plusieurs pages/slices -> on garde la première (Slice 1/1 comme sur la capture)
-    if data.ndim == 3:
-        # Cas (N, H, W) : pile de slices -> on prend la première
-        if data.shape[0] < data.shape[-1]:
-            data = data[0]
-        # Cas (H, W, C) : image couleur/RGB -> on convertit en niveaux de gris
-        else:
-            data = data.mean(axis=-1)
-
-    data = data.astype(np.float64)
-
-    # Valeurs "invalides" fréquentes dans les cartes de mesure 3D (NaN, valeurs
-    # sentinelles très grandes comme -32768, 65535, etc.) -> on les masque
-    data[np.isclose(data, -32768)] = np.nan
-    data[np.isclose(data, 65535)] = np.nan
-
-    return data
+ax.format_coord = format_coord
 
 
-# --------------------------------------------------------------------------- #
-# 2. Comptage des "objets" (pics/creux isolés au-delà d'un seuil)
-# --------------------------------------------------------------------------- #
-def count_objects(data: np.ndarray, threshold_mm: float) -> int:
-    """Compte les régions connexes dont |rugosité| dépasse threshold_mm.
+# ==================================================
+# Affichage
+# ==================================================
 
-    Reproduit le principe du "Object Count" affiché par les logiciels de
-    métrologie de surface (comptage des pics/défauts locaux détectés).
-    """
-
-
-    mask = np.abs(np.nan_to_num(data, nan=0.0)) > threshold_mm
-    labeled, n_objects = ndimage.label(mask)
-    return int(n_objects)
-
-
-# --------------------------------------------------------------------------- #
-# 3. Rendu de la figure (style "profilomètre")
-# --------------------------------------------------------------------------- #
-def render_figure(
-    data: np.ndarray,
-    pixel_size_mm: float,
-    vmin: float,
-    vmax: float,
-    object_count: int,
-    source_name: str,
-    label: str = "Height",
-    unit: str = "mm",
-    yaw: float = 90.0,
-    pitch: float = 90.0,
-    roll: float = 90.0,
-):
-    h, w = data.shape
-    width_mm = w * pixel_size_mm
-    height_mm = h * pixel_size_mm
-
-    # Figure fond noir, proportions larges (comme la capture d'écran)
-    fig = plt.figure(figsize=(12.8, 8.4), facecolor="black")
-    ax_img = fig.add_axes([0.0, 0.30, 1.0, 0.42])      # zone carte
-    ax_cbar = fig.add_axes([0.10, 0.10, 0.80, 0.035])  # échelle de couleur horizontale
-    ax_text = fig.add_axes([0.0, 0.0, 1.0, 1.0])       # calque texte transparent
-    ax_text.set_facecolor("none")
-    ax_text.axis("off")
-
-    # --- Carte de rugosité (colormap "jet" : bleu -> cyan -> vert -> jaune -> rouge) ---
-    cmap = matplotlib.colormaps["jet"].copy() if hasattr(matplotlib, "colormaps") else cm.get_cmap("jet").copy()
-    cmap.set_bad(color="black")  # NaN affichés en noir
-    im = ax_img.imshow(
-        data,
-        cmap=cmap,
-        vmin=vmin,
-        vmax=vmax,
-        aspect="auto",
-        interpolation="nearest",  # pas de lissage -> conserve le détail/bruit réel
-    )
-    ax_img.axis("off")
-    ax_img.text(-0.01, 0.5, "Z", transform=ax_img.transAxes, color="white",
-                fontsize=9, ha="right", va="center")
-    ax_img.text(1.01, 0.5, "Z", transform=ax_img.transAxes, color="white",
-                fontsize=9, ha="left", va="center")
-
-    # --- Échelle de couleur horizontale ---
-    norm = Normalize(vmin=vmin, vmax=vmax)
-    cbar = fig.colorbar(cm.ScalarMappable(norm=norm, cmap=cmap), cax=ax_cbar,
-                         orientation="horizontal")
-    cbar.outline.set_edgecolor("black")
-    cbar.ax.xaxis.set_tick_params(color="#1E90FF", labelcolor="#1E90FF", labelsize=10)
-    cbar.set_label(f"{label} ({unit})", color="#1E90FF", fontsize=12, labelpad=8)
-    ax_text.text(0.5, 0.155, "", transform=ax_text.transAxes)  # espace réservé
-
-    # --- Panneau d'informations (haut gauche), même style que la capture ---
-    blue = "#3399FF"
-    span = abs(vmax - vmin)
-    decimals = 2 if span >= 1 else (3 if span >= 0.1 else 4)
-    info_lines = [
-        f"{width_mm:.2f} X {height_mm:.2f} mm",
-        f"Range Min: {vmin:.{decimals}f} Max: {vmax:.{decimals}f} {unit}",
-        "Slice 1 / 1",
-        "",
-        f"Yaw: {yaw:.1f} °",
-        f"Pitch: {pitch:.1f} °",
-        f"Roll: {roll:.1f} °",
-    ]
-    y0 = 0.97
-    for i, line in enumerate(info_lines):
-        ax_text.text(0.01, y0 - i * 0.032, line, color=blue, fontsize=13,
-                     family="sans-serif", va="top", ha="left")
-
-    # --- Object Count (bas gauche) ---
-    ax_text.text(0.01, 0.045, f"Object Count: {object_count}", color=blue,
-                 fontsize=13, va="top", ha="left")
-
-    # --- nom du fichier / horodatage export (discret, coin bas droit) ---
-    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
-    ax_text.text(0.99, 0.01, f"{source_name}  |  exporté le {stamp}", color="#555555",
-                 fontsize=8, va="bottom", ha="right")
-
-    return fig
-
-
-# --------------------------------------------------------------------------- #
-# 4. Programme principal
-# --------------------------------------------------------------------------- #
-def main():
-    parser = argparse.ArgumentParser(description="Visualisation de carte de rugosité TIFF")
-    parser.add_argument("--input", "-i", default=None,
-                         help="Fichier TIFF d'entrée (optionnel : sinon auto-détection ou fenêtre de sélection)")
-    parser.add_argument("--label", default="Height", help="Nom de la grandeur (ex: Height, Roughness)")
-    parser.add_argument("--unit", default="mm", help="Unité de la grandeur (ex: mm, µm)")
-    parser.add_argument("--pixel-size-mm", type=float, default=None,
-                         help="Taille d'un pixel en mm (sinon calculée pour donner ~34.35 mm de large)")
-    parser.add_argument("--vmin", type=float, default=None, help="Borne min de l'échelle (mm)")
-    parser.add_argument("--vmax", type=float, default=None, help="Borne max de l'échelle (mm)")
-    parser.add_argument("--object-threshold", type=float, default=None,
-                         help="Seuil |mm| pour le comptage d'objets (défaut: 90e percentile)")
-    parser.add_argument("--output", "-o", default=None, help="Fichier image de sortie (.png)")
-    parser.add_argument("--dpi", type=int, default=300, help="Résolution d'export (dpi)")
-    parser.add_argument("--export-data", action="store_true",
-                         help="Exporte aussi les données brutes en .csv")
-    args = parser.parse_args()
-
-    args.input = resolve_input_path(args.input)
-    if not os.path.isfile(args.input):
-        sys.exit(f"Fichier introuvable : {args.input}")
-
-    print(f"Lecture de {args.input} ...")
-    data = load_roughness_map(args.input)
-    h, w = data.shape
-    print(f"  Dimensions : {w} x {h} pixels")
-
-    # Taille de pixel : si non fournie, on la déduit pour retrouver ~34.35 mm de large
-    # (valeur de référence de la capture d'écran) ; à ajuster selon votre calibration réelle.
-    pixel_size_mm = args.pixel_size_mm if args.pixel_size_mm else 34.35 / w
-
-    vmin = args.vmin if args.vmin is not None else float(np.nanmin(data))
-    vmax = args.vmax if args.vmax is not None else float(np.nanmax(data))
-    print(f"  Range : {vmin:.4f} à {vmax:.4f} mm")
-
-    threshold = args.object_threshold if args.object_threshold is not None else float(
-        np.nanpercentile(np.abs(np.nan_to_num(data, nan=0.0)), 90)
-    )
-    n_objects = count_objects(data, threshold)
-    print(f"  Object Count (seuil {threshold:.4f} {args.unit}) : {n_objects}")
-
-    fig = render_figure(
-        data,
-        pixel_size_mm=pixel_size_mm,
-        vmin=vmin,
-        vmax=vmax,
-        object_count=n_objects,
-        source_name=os.path.basename(args.input),
-        label=args.label,
-        unit=args.unit,
-    )
-
-    output_path = args.output or (os.path.splitext(args.input)[0] + "_view.png")
-    fig.savefig(output_path, dpi=args.dpi, facecolor="black")
-    print(f"Image exportée : {output_path} ({args.dpi} dpi)")
-
-    if args.export_data:
-        csv_path = os.path.splitext(args.input)[0] + "_data.csv"
-        np.savetxt(csv_path, data, delimiter=",", fmt="%.6f")
-        print(f"Données exportées : {csv_path}")
-
-
-if __name__ == "__main__":
-    main()
-    # Petite pause pour garder la fenêtre ouverte en cas de double-clic sous Windows
-    if sys.platform.startswith("win") and os.environ.get("PROMPT") is None:
-        input("\nTerminé. Appuyez sur Entrée pour fermer...")
+plt.show()
