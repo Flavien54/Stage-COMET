@@ -1,0 +1,134 @@
+"""
+==================================================
+Heatmap des métriques de rugosité (matplotlib pur, sans plotly)
+==================================================
+
+Dépendances : pip install pandas matplotlib numpy
+"""
+
+import glob
+import os
+import re
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.colors import Normalize
+
+# ==================================================
+# Sélection des fichiers CSV
+# ==================================================
+
+csv_folder = os.path.dirname(os.path.abspath(__file__))
+csv_files = sorted(glob.glob(os.path.join(csv_folder, "**", "*surface.csv"), recursive=True))
+
+if not csv_files:
+    print("Aucun fichier *-surface.csv trouvé sous :", csv_folder)
+    raise SystemExit
+
+print(f"{len(csv_files)} fichier(s) trouvé(s).")
+
+
+def normalize_sample_name(base_name: str) -> str:
+    stripped = re.sub(r"echantillon", "", base_name, flags=re.IGNORECASE)
+    stripped = re.sub(r"-?surface$", "", stripped, flags=re.IGNORECASE)
+    stripped = stripped.strip("-_ ")
+    match = re.match(r"([A-Za-z]+)-?(\d+)", stripped)
+    if match:
+        return f"{match.group(1).upper()}-{match.group(2)}"
+    return stripped
+
+
+LENGTH_METRICS = {"Sa", "Sq", "Sv", "Sp", "Sz", "Ra", "Rq", "Rv", "Rp", "Rz"}
+
+# ==================================================
+# Lecture -> DataFrame (lignes = échantillons, colonnes = métriques)
+# ==================================================
+
+rows = {}
+for path in csv_files:
+    base_name = os.path.splitext(os.path.basename(path))[0]
+    sample_name = normalize_sample_name(base_name)
+
+    df_metrics = pd.read_csv(path)
+    metrics = dict(zip(df_metrics["Metric"], df_metrics["Value"]))
+    for key in metrics:
+        if key in LENGTH_METRICS:
+            metrics[key] = metrics[key] * 1e6  # m -> µm
+
+    rows[sample_name] = metrics
+
+df = pd.DataFrame(rows).T.sort_index()  # index = échantillons, colonnes = métriques
+metric_cols = [c for c in ["Sa", "Sq", "Sv", "Sp", "Sz", "Ssk", "Sku",
+                            "Ra", "Rq", "Rv", "Rp", "Rz", "Rsk", "Rku"] if c in df.columns]
+df = df[metric_cols]
+
+samples = df.index.tolist()
+n_samples = len(samples)
+n_metrics = len(metric_cols)
+
+# Normalisation min-max par colonne (0-1), nécessaire pour comparer des
+# métriques d'unités très différentes (µm vs sans unité) sur une même échelle
+df_norm = (df - df.min()) / (df.max() - df.min())
+df_norm = df_norm.fillna(0.0)  # colonne constante -> évite une division par 0
+
+
+# ==================================================
+# Heatmap
+# ==================================================
+
+CMAP_NAME = "viridis"  # ou "plasma"
+cmap = plt.get_cmap(CMAP_NAME)
+norm = Normalize(vmin=0, vmax=1)
+
+fig, ax = plt.subplots(
+    figsize=(max(9, 0.85 * n_metrics + 3), max(4, 0.55 * n_samples + 2)),
+    facecolor="w",
+)
+
+im = ax.imshow(df_norm.values, cmap=cmap, norm=norm, aspect="auto")
+
+# Grille blanche fine entre les cellules (style "propre")
+ax.set_xticks(np.arange(-0.5, n_metrics, 1), minor=True)
+ax.set_yticks(np.arange(-0.5, n_samples, 1), minor=True)
+ax.grid(which="minor", color="white", linewidth=2)
+ax.tick_params(which="minor", bottom=False, left=False)
+
+ax.set_xticks(range(n_metrics))
+ax.set_xticklabels(metric_cols, fontsize=10)
+ax.set_yticks(range(n_samples))
+ax.set_yticklabels(samples, fontsize=10)
+
+ax.set_title("Métriques de rugosité par échantillon", fontsize=14, pad=14, loc="left")
+
+# Supprime le cadre extérieur, garde une présentation épurée
+for spine in ax.spines.values():
+    spine.set_visible(False)
+ax.tick_params(length=0)
+
+# Annotation des valeurs réelles dans chaque cellule, couleur de texte
+# adaptée à la luminosité de la cellule (lisible sur clair ET sur foncé)
+for i in range(n_samples):
+    for j, col in enumerate(metric_cols):
+        val = df.iloc[i, j]
+        rgba = cmap(norm(df_norm.iloc[i, j]))
+        luminance = 0.299 * rgba[0] + 0.587 * rgba[1] + 0.114 * rgba[2]
+        text_color = "white" if luminance < 0.55 else "black"
+        ax.text(j, i, f"{val:.2f}", ha="center", va="center",
+                 fontsize=8.5, color=text_color)
+
+cbar = fig.colorbar(im, ax=ax, shrink=0.85, pad=0.02)
+cbar.set_label("Valeur normalisée (0 = min, 1 = max, par métrique)", fontsize=10)
+cbar.outline.set_visible(False)
+
+fig.tight_layout()
+
+# ==================================================
+# Export
+# ==================================================
+
+output_path = os.path.join(csv_folder, "heatmap_metriques_rugosite.png")
+fig.savefig(output_path, dpi=220, bbox_inches="tight")
+print("Export PNG terminé :", output_path)
+
+plt.show()
