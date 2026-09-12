@@ -1,8 +1,13 @@
 """
 ==================================================
-Affichage carte surface TIFF en 3D - Version simple
+Affichage carte surface TIFF en 3D - Version générique
+(s'adapte automatiquement aux fichiers "aligned" et
+ "roughness" en fonction du nom de fichier)
 ==================================================
 """
+
+import re
+import os
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -30,6 +35,40 @@ if not filename:
 
 print(f"Fichier chargé :\n{filename}")
 
+base_name = os.path.splitext(os.path.basename(filename))[0]
+
+# ==================================================
+# Détection du type de donnée (aligned / roughness)
+# à partir du nom de fichier
+# ==================================================
+# -> Ajoute simplement tes propres mots-clés dans les
+#    regex ci-dessous si tes fichiers utilisent une
+#    autre convention de nommage.
+
+if re.search(r"rough|rugo", base_name, re.IGNORECASE):
+    data_type = "roughness"
+elif re.search(r"align", base_name, re.IGNORECASE):
+    data_type = "aligned"
+else:
+    print(f'Type de donnée non détecté dans "{base_name}" -> "aligned" par défaut.')
+    data_type = "aligned"
+
+if data_type == "aligned":
+    type_label_fr = "Hauteur alignée"
+    type_label_titre = "aligned"
+    unit_label = "mm"
+    unit_factor = 1e3  # conversion m -> mm
+else:  # roughness
+    type_label_fr = "Rugosité"
+    type_label_titre = "roughness"
+    unit_label = "µm"
+    unit_factor = 1e6  # conversion m -> µm (ajuste si déjà en µm : mettre 1.0)
+
+# Nom d'échantillon "propre" : on retire le mot-clé de type du nom de fichier
+sample_label = re.sub(r"[-_ ]?(aligned|rough|rugo).*", "", base_name, flags=re.IGNORECASE)
+if not sample_label:
+    sample_label = base_name
+
 # ==================================================
 # Lecture TIFF
 # ==================================================
@@ -40,8 +79,8 @@ if img.ndim > 2:
 
 img = img.astype(np.float64)
 
-# Conversion m -> mm
-img = img * 1e3
+# Conversion selon le type de donnée détecté
+img = img * unit_factor
 
 # Gestion NaN
 if np.isnan(img).any():
@@ -75,13 +114,17 @@ vmax = np.nanmax(img)
 # Figure 3D - fond blanc classique
 # ==================================================
 
+fig_title = f"{sample_label} - Surface {type_label_titre} map"
+z_label_str = f"{type_label_fr} ({unit_label})"
+
 fig = plt.figure(figsize=(10, 7), facecolor="w")
+fig.canvas.manager.set_window_title(fig_title)
 ax = fig.add_subplot(111, projection="3d")
 ax.set_facecolor("w")
 
-# Sous-échantillonnage POUR L'AFFICHAGE UNIQUEMENT (les données restent intactes).
-# plot_surface devient très lourd / peut planter au-delà de quelques centaines
-# de milliers de points -> on vise ~300x300 points affichés max.
+# Sous-échantillonnage POUR L'AFFICHAGE UNIQUEMENT (données img intactes).
+# plot_surface devient très lourd / peut planter au-delà de quelques
+# centaines de milliers de points -> on vise ~300x300 points affichés max.
 max_points_per_axis = 300
 step_r = max(1, n_rows // max_points_per_axis)
 step_c = max(1, n_cols // max_points_per_axis)
@@ -98,12 +141,14 @@ surf = ax.plot_surface(
 )
 
 cbar = fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1)
-cbar.set_label("Aligned (mm)")
+cbar.set_label(z_label_str, color="k")
+cbar.ax.yaxis.set_tick_params(color="k")
+plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="k")
 
-ax.set_xlabel("Y (mm)")
-ax.set_ylabel("Z (mm)")
-ax.set_zlabel("Aligned (mm)")
-ax.set_title("EchantillonCM-11 - Surface aligned map")
+ax.set_xlabel("Y (mm)", color="k")
+ax.set_ylabel("Z (mm)", color="k")
+ax.set_zlabel(z_label_str, color="k")
+ax.set_title(fig_title, color="k", fontweight="bold")
 
 ax.view_init(elev=30, azim=45)
 
