@@ -1,75 +1,56 @@
-import matplotlib
-matplotlib.use("TkAgg")
-
-import tkinter as tk
-from tkinter import filedialog
+"""
+==================================================
+Affichage carte surface TIFF en 3D - Version simple
+==================================================
+"""
 
 import numpy as np
-import tifffile
-
 import matplotlib.pyplot as plt
-from matplotlib.gridspec import GridSpec
-
+from matplotlib import cm
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (nécessaire pour projection='3d')
 from scipy.ndimage import zoom
-
+from tkinter import Tk, filedialog
+import tifffile
 
 # ==================================================
 # Sélection fichier TIFF
 # ==================================================
 
-root = tk.Tk()
+root = Tk()
 root.withdraw()
-
 filename = filedialog.askopenfilename(
     title="Sélectionner la carte surface TIFF",
     filetypes=[("TIFF files", "*.tif *.tiff")]
 )
+root.destroy()
 
-if filename == "":
+if not filename:
     print("Aucun fichier sélectionné")
-    exit()
+    raise SystemExit
 
-print("Fichier chargé :")
-print(filename)
-
+print(f"Fichier chargé :\n{filename}")
 
 # ==================================================
 # Lecture TIFF
 # ==================================================
 
 img = tifffile.imread(filename)
+if img.ndim > 2:
+    img = img[0]  # slice 1 si stack
 
-print("\nInformations TIFF")
-print("----------------")
-print("Dimensions :", img.shape)
-print("Type :", img.dtype)
-print("Min brut :", np.nanmin(img))
-print("Max brut :", np.nanmax(img))
-
-if img.ndim == 3:
-    print("Stack 3D détecté -> slice 0")
-    img = img[0]
-
-img = img.astype(float)
+img = img.astype(np.float64)
 
 # Conversion m -> mm
 img = img * 1e3
 
-print("\nAprès conversion mm")
-print("-------------------")
-print("Min :", np.nanmin(img), "mm")
-print("Max :", np.nanmax(img), "mm")
-
 # Gestion NaN
 if np.isnan(img).any():
-    print("NaN détectés")
-    img[np.isnan(img)] = np.nanmean(img)
+    mean_val = np.nanmean(img)
+    img = np.nan_to_num(img, nan=mean_val)
 
-# Sur-échantillonnage
+# Sur-échantillonnage (bicubique, order=3)
 scale = 4
-img = zoom(img, zoom=scale, order=3)
-print("Nouvelle résolution :", img.shape)
-
+img = zoom(img, scale, order=3)
 
 # ==================================================
 # Dimensions physiques
@@ -78,150 +59,53 @@ print("Nouvelle résolution :", img.shape)
 width_mm = 34.96
 height_mm = 23.57
 
+n_rows, n_cols = img.shape
+y = np.linspace(0, width_mm, n_cols)
+z = np.linspace(0, height_mm, n_rows)
+Y, Z = np.meshgrid(y, z)
 
 # ==================================================
 # Echelle couleur
 # ==================================================
 
-vmin = -0.08
-vmax = 0.04
-
-if np.nanmin(img) > vmin or np.nanmax(img) < vmax:
-    vmin = np.nanmin(img)
-    vmax = np.nanmax(img)
-
+vmin = np.nanmin(img)
+vmax = np.nanmax(img)
 
 # ==================================================
-# Figure
+# Figure 3D - fond blanc classique
 # ==================================================
 
-plt.style.use("dark_background")
+fig = plt.figure(figsize=(10, 7), facecolor="w")
+ax = fig.add_subplot(111, projection="3d")
+ax.set_facecolor("w")
 
-# Fenêtre plus grande
-fig = plt.figure(figsize=(20, 9), dpi=110)
-fig.patch.set_facecolor("black")
+# Sous-échantillonnage POUR L'AFFICHAGE UNIQUEMENT (les données restent intactes).
+# plot_surface devient très lourd / peut planter au-delà de quelques centaines
+# de milliers de points -> on vise ~300x300 points affichés max.
+max_points_per_axis = 300
+step_r = max(1, n_rows // max_points_per_axis)
+step_c = max(1, n_cols // max_points_per_axis)
 
-# Layout :
-#   - Colonne gauche : infos
-#   - Colonne droite : carte + colorbar horizontale en bas
-gs = GridSpec(
-    2, 2,
-    figure=fig,
-    width_ratios=[0.13, 1.0],
-    height_ratios=[1.0, 0.06],
-    wspace=0.02,
-    hspace=0.25,
-    left=0.02, right=0.98,
-    top=0.94, bottom=0.10
+surf = ax.plot_surface(
+    Y[::step_r, ::step_c],
+    Z[::step_r, ::step_c],
+    img[::step_r, ::step_c],
+    cmap=cm.jet,
+    vmin=vmin, vmax=vmax,
+    linewidth=0,
+    antialiased=False,
+    rstride=1, cstride=1
 )
 
+cbar = fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1)
+cbar.set_label("Aligned (mm)")
 
-# --------------------------------------------------
-# Panneau d'information (gauche, sur les 2 lignes)
-# --------------------------------------------------
-ax_info = fig.add_subplot(gs[:, 0])
-ax_info.axis("off")
+ax.set_xlabel("Y (mm)")
+ax.set_ylabel("Z (mm)")
+ax.set_zlabel("Aligned (mm)")
+ax.set_title("EchantillonCM-11 - Surface aligned map")
 
-info = (
-    f"{width_mm:.2f} × {height_mm:.2f} mm\n\n"
-    f"Range  Min: {np.nanmin(img):.2f}  Max: {np.nanmax(img):.2f} mm\n\n"
-    f"Slice 1 / 1\n\n\n"
-    f"Yaw:   90.0 °\n\n"
-    f"Pitch: 90.0 °\n\n"
-    f"Roll:  91.2 °"
-)
+ax.view_init(elev=30, azim=45)
 
-ax_info.text(
-    0.0, 1.0, info,
-    fontsize=13,
-    color="#4fc3f7",
-    verticalalignment="top",
-    horizontalalignment="left",
-    family="sans-serif",
-    transform=ax_info.transAxes
-)
-
-
-# --------------------------------------------------
-# Carte principale (haut droite) — large
-# --------------------------------------------------
-ax = fig.add_subplot(gs[0, 1])
-
-im = ax.imshow(
-    img,
-    cmap="jet",
-    origin="lower",
-    extent=[0, width_mm, 0, height_mm],
-    interpolation="bicubic",
-    vmin=vmin,
-    vmax=vmax,
-    aspect="auto"          # étire pour remplir toute la largeur
-)
-
-ax.set_xlim(0, width_mm)
-ax.set_ylim(0, height_mm)
-
-ax.set_xlabel("Y (mm)", fontsize=12)
-ax.set_ylabel("Z (mm)", fontsize=12)
-ax.set_title("EchantillonCM-11 - Surface aligned map", fontsize=15, pad=8)
-
-# Couleurs des ticks
-ax.tick_params(colors="white", labelsize=11)
-
-
-# --------------------------------------------------
-# Colorbar horizontale (bas droite)
-# --------------------------------------------------
-ax_cbar = fig.add_subplot(gs[1, 1])
-
-cbar = fig.colorbar(
-    im,
-    cax=ax_cbar,
-    orientation="horizontal"
-)
-
-cbar.set_label("Aligned (mm)", fontsize=12, color="white")
-cbar.ax.tick_params(colors="white", labelsize=11)
-cbar.outline.set_edgecolor("white")
-
-
-# --------------------------------------------------
-# Petite annotation "Object Count" en bas à gauche
-# --------------------------------------------------
-fig.text(
-    0.02, 0.02,
-    "Object Count: 194",
-    fontsize=12,
-    color="#4fc3f7",
-    ha="left", va="bottom"
-)
-
-
-# ==================================================
-# Toolbar : coordonnées en mm
-# ==================================================
-
-def format_coord(x, y):
-    try:
-        col = int((x / width_mm) * img.shape[1])
-        row = int((y / height_mm) * img.shape[0])
-        if 0 <= row < img.shape[0] and 0 <= col < img.shape[1]:
-            value = img[row, col]
-            return (
-                f"X={x:.3f} mm   "
-                f"Y={y:.3f} mm   "
-                f"Z={value:.5f} mm"
-            )
-    except Exception:
-        pass
-    return f"X={x:.3f} mm   Y={y:.3f} mm"
-
-
-ax.format_coord = format_coord
-
-
-# ==================================================
-# Affichage
-# ==================================================
-
+plt.tight_layout()
 plt.show()
