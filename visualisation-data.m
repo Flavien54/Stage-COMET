@@ -1,5 +1,7 @@
 %% ==================================================
-%  Affichage carte surface TIFF en 3D - Version simple
+%  Affichage carte surface TIFF en 3D - Version générique
+%  (s'adapte automatiquement aux fichiers "aligned" et
+%   "roughness" en fonction du nom de fichier)
 %  ==================================================
 clear; clc; close all;
 
@@ -18,6 +20,47 @@ end
 filename = fullfile(filePath, fileName);
 fprintf('Fichier chargé :\n%s\n', filename);
 
+[~, baseName, ~] = fileparts(fileName);
+
+
+%% ==================================================
+%  Détection du type de donnée (aligned / roughness)
+%  à partir du nom de fichier
+%  ==================================================
+%  -> Ajoute simplement tes propres mots-clés dans les
+%     regexp ci-dessous si tes fichiers utilisent une
+%     autre convention de nommage.
+
+if ~isempty(regexpi(baseName, 'rough|rugo', 'once'))
+    dataType = 'roughness';
+elseif ~isempty(regexpi(baseName, 'align', 'once'))
+    dataType = 'aligned';
+else
+    warning(['Type de donnée non détecté dans le nom du fichier ' ...
+             '("%s") -> "aligned" utilisé par défaut.'], baseName);
+    dataType = 'aligned';
+end
+
+switch dataType
+    case 'aligned'
+        typeLabelFr   = 'Hauteur alignée';
+        typeLabelTitre = 'aligned';
+        unitLabel     = 'mm';
+        unitFactor    = 1e3;   % conversion m -> mm
+    case 'roughness'
+        typeLabelFr   = 'Rugosité';
+        typeLabelTitre = 'roughness';
+        unitLabel     = '\mum';  % micromètres
+        unitFactor    = 1e6;   % conversion m -> µm (à ajuster si les données
+                                % sont déjà en µm : mettre unitFactor = 1)
+end
+
+% Nom d'échantillon "propre" : on retire le mot-clé de type du nom de fichier
+sampleLabel = regexprep(baseName, '[-_ ]?(aligned|rough|rugo).*', '', 'ignorecase');
+if isempty(sampleLabel)
+    sampleLabel = baseName;
+end
+
 
 %% ==================================================
 %  Lecture TIFF
@@ -26,8 +69,8 @@ fprintf('Fichier chargé :\n%s\n', filename);
 img = imread(filename, 1);
 img = double(img);
 
-% Conversion m -> mm
-img = img * 1e3;
+% Conversion selon le type de donnée détecté
+img = img * unitFactor;
 
 % Gestion NaN
 if any(isnan(img(:)))
@@ -65,30 +108,50 @@ vmax = max(img(:), [], 'omitnan');
 %  Figure 3D - fond blanc classique
 %  ==================================================
 
+figTitle = sprintf('%s - Surface %s map', sampleLabel, typeLabelTitre);
+
 fig = figure('Color', 'w', 'Position', [80 80 1000 700], ...
-    'Name', 'EchantillonCM-11 - Surface aligned map 3D');
+    'Name', [figTitle ' 3D']);
 
 ax = axes('Parent', fig);
-surf(ax, Y, Z, img, 'EdgeColor', 'none');
+
+% Sous-échantillonnage POUR L'AFFICHAGE UNIQUEMENT (données img intactes).
+% surf() devient très lourd / peut planter au-delà de quelques centaines
+% de milliers de points -> on vise ~300x300 points affichés max.
+maxPointsPerAxis = 300;
+stepR = max(1, floor(nRows / maxPointsPerAxis));
+stepC = max(1, floor(nCols / maxPointsPerAxis));
+
+surf(ax, Y(1:stepR:end, 1:stepC:end), ...
+         Z(1:stepR:end, 1:stepC:end), ...
+         img(1:stepR:end, 1:stepC:end), ...
+         'EdgeColor', 'none');
 
 colormap(ax, jet);
 caxis(ax, [vmin vmax]);
-colorbar;
 
-xlabel(ax, 'Y (mm)');
-ylabel(ax, 'Z (mm)');
-zlabel(ax, 'Aligned (mm)');
-title(ax, 'EchantillonCM-11 - Surface aligned map');
+zLabelStr = sprintf('%s (%s)', typeLabelFr, unitLabel);
+
+xlabel(ax, 'Y (mm)', 'Color', 'k');
+ylabel(ax, 'Z (mm)', 'Color', 'k');
+zlabel(ax, zLabelStr, 'Color', 'k');
+title(ax, figTitle, 'Color', 'k', 'FontWeight', 'bold');
 
 axis(ax, 'tight');
 view(ax, 45, 30);
 shading(ax, 'interp');
 
-% Style MATLAB classique : fond blanc, grille grise, axes noirs
+% Style MATLAB classique : fond blanc, grille grise claire, axes/texte noir pur
 set(ax, 'Color', 'w', ...
-    'XColor', [0.15 0.15 0.15], ...
-    'YColor', [0.15 0.15 0.15], ...
-    'ZColor', [0.15 0.15 0.15], ...
-    'GridColor', [0.15 0.15 0.15], ...
-    'GridAlpha', 0.15, ...
+    'XColor', 'k', ...
+    'YColor', 'k', ...
+    'ZColor', 'k', ...
+    'GridColor', [0.5 0.5 0.5], ...
+    'GridAlpha', 0.25, ...
     'Box', 'on');
+
+set(get(ax, 'Title'), 'Color', 'k');
+cb = colorbar;
+cb.Color = 'k';
+cb.Label.String = zLabelStr;
+cb.Label.Color = 'k';
