@@ -22,10 +22,27 @@ import tifffile
 # Paramètres de filtrage des artefacts de bord
 # ==================================================
 
-# 1) Rognage de bordure : % de lignes/colonnes retirées sur CHAQUE bord.
-#    Ex: 0.03 = on retire 3% en haut, 3% en bas, 3% à gauche, 3% à droite.
-#    Mets 0.0 pour désactiver.
-EDGE_CROP_PERCENT = 0.03
+# 1) Rognage de bordure ADAPTATIF : au lieu d'un % fixe, on avance depuis
+#    chaque bord (haut/bas/gauche/droite) tant que la ligne/colonne est
+#    anormalement bruitée par rapport au coeur de l'image, et on s'arrête
+#    dès que ça se stabilise. Chaque échantillon (et chaque côté) est donc
+#    rogné à la profondeur qui lui est propre, au lieu d'un montant fixe
+#    qui peut être insuffisant sur certaines pièces.
+AUTO_EDGE_CROP = True
+MAX_EDGE_CROP_PERCENT = 0.30   # garde-fou : jamais plus de 30% rogné par côté
+EDGE_STD_FACTOR = 2.5          # une ligne/colonne est "mauvaise" si son écart-type
+                                # dépasse EDGE_STD_FACTOR x l'écart-type du coeur
+EDGE_MEAN_FACTOR = 2.5         # ... OU si sa moyenne s'écarte de la moyenne du coeur
+                                # de plus de EDGE_MEAN_FACTOR x l'écart-type du coeur
+                                # (détecte les plateaux décalés en hauteur, pas
+                                # seulement le bruit — une zone peut être "plate"
+                                # mais à un niveau de hauteur aberrant)
+EDGE_CONSECUTIVE_GOOD_REQUIRED = 5  # nb de lignes/colonnes "propres" consécutives
+                                # exigées avant d'arrêter le rognage. Évite qu'une
+                                # seule ligne isolée "propre" par hasard (ex: pixel
+                                # mort/dropout à valeur figée en tout bord) ne stoppe
+                                # le rognage trop tôt, en laissant passer la vraie
+                                # zone corrompue juste derrière.
 
 # 2) Despike robuste (filtre médian + seuil MAD) : remplace les pixels
 #    trop éloignés de la médiane locale par cette médiane locale.
@@ -62,13 +79,13 @@ base_name = os.path.splitext(os.path.basename(filename))[0]
 #    regex ci-dessous si tes fichiers utilisent une
 #    autre convention de nommage.
 
-if re.search(r"rough|rugo", base_name, re.IGNORECASE):
+if re.search(r"rough|rugo|\bsa\b|\bsq\b|\bsz\b|rms", base_name, re.IGNORECASE):
     data_type = "roughness"
 elif re.search(r"align", base_name, re.IGNORECASE):
     data_type = "aligned"
 else:
-    print(f'Type de donnée non détecté dans "{base_name}" -> "aligned" par défaut.')
-    data_type = "aligned"
+    print(f'Type de donnée non détecté dans "{base_name}" -> "roughness" par défaut.')
+    data_type = "roughness"
 
 # Les deux types sont maintenant affichés en micromètres (µm).
 # Ajuste unit_factor si tes données brutes ne sont pas en mètres
@@ -87,6 +104,64 @@ else:  # roughness
 sample_label = re.sub(r"[-_ ]?(aligned|rough|rugo).*", "", base_name, flags=re.IGNORECASE)
 if not sample_label:
     sample_label = base_name
+
+
+def auto_edge_crop(data: np.ndarray, max_crop_fraction: float = 0.30,
+                    std_factor: float = 2.5, mean_factor: float = 2.5,
+                    consecutive_good_required: int = 5) -> tuple:
+    """
+    Rogne chaque bord (haut/bas/gauche/droite) indépendamment, en avançant
+    ligne par ligne / colonne par colonne depuis le bord tant que cette
+    ligne/colonne est jugée "mauvaise" par rapport au coeur de l'image
+    (zone centrale 50% x 50%, supposée saine). Une ligne/colonne est
+    considérée mauvaise si :
+      - son écart-type dépasse `std_factor` x l'écart-type du coeur (bruit), OU
+      - sa moyenne s'écarte de la moyenne du coeur de plus de `mean_factor`
+        x l'écart-type du coeur (plateau/décalage de niveau, même sans bruit).
+    Le rognage ne s'arrête que lorsque `consecutive_good_required` lignes/
+    colonnes propres se suivent d'affilée — une seule ligne isolée propre au
+    milieu d'une zone corrompue (ex: pixel mort/dropout figé à une valeur qui
+    ressemble par hasard au coeur) ne suffit donc pas à arrêter le rognage
+    prématurément et à laisser passer l'artefact juste derrière.
+    On plafonne à `max_crop_fraction` (garde-fou pour éviter de tout rogner
+    sur une image globalement problématique).
+    Retourne (image_rognée, (top, bottom, left, right)).
+    """
+    n_rows, n_cols = data.shape
+    r0, r1 = int(n_rows * 0.25), int(n_rows * 0.75)
+    c0, c1 = int(n_cols * 0.25), int(n_cols * 0.75)
+    core = data[r0:r1, c0:c1]
+    core_std = np.std(core)
+    core_mean = np.mean(core)
+
+    def is_bad(line: np.ndarray) -> bool:
+        mean_dev = abs(np.mean(line) - core_mean) / (core_std + 1e-9)
+        std_dev = np.std(line) / (core_std + 1e-9)
+        return (std_dev > std_factor) or (mean_dev > mean_factor)
+
+    def scan(length: int, get_line):
+        max_crop = max(1, int(length * max_crop_fraction))
+        crop = 0
+        good_streak = 0
+        for i in range(max_crop):
+            if is_bad(get_line(i)):
+                crop = i + 1
+                good_streak = 0
+            else:
+                good_streak += 1
+                if good_streak >= consecutive_good_required:
+                    break
+        return crop
+
+    # Chaque scan ne regarde que la zone CENTRALE de l'AUTRE axe, pour ne
+    # pas être pollué par un artefact sur un bord perpendiculaire.
+    top = scan(n_rows, lambda i: data[i, c0:c1])
+    bottom = scan(n_rows, lambda i: data[n_rows - 1 - i, c0:c1])
+    left = scan(n_cols, lambda i: data[r0:r1, i])
+    right = scan(n_cols, lambda i: data[r0:r1, n_cols - 1 - i])
+
+    cropped = data[top:n_rows - bottom, left:n_cols - right]
+    return cropped, (top, bottom, left, right)
 
 
 def despike_mad(data: np.ndarray, kernel_size: int = 5, threshold: float = 6.0) -> np.ndarray:
@@ -138,15 +213,22 @@ height_mm = 23.57
 
 n_rows_raw, n_cols_raw = img.shape
 
-if EDGE_CROP_PERCENT > 0:
-    crop_r = int(round(n_rows_raw * EDGE_CROP_PERCENT))
-    crop_c = int(round(n_cols_raw * EDGE_CROP_PERCENT))
-    if crop_r > 0 or crop_c > 0:
-        img = img[crop_r:n_rows_raw - crop_r, crop_c:n_cols_raw - crop_c]
-        # Les dimensions physiques suivent la même proportion que le rognage
-        width_mm *= (n_cols_raw - 2 * crop_c) / n_cols_raw
-        height_mm *= (n_rows_raw - 2 * crop_r) / n_rows_raw
-        print(f"Rognage bordure : {crop_r} ligne(s) / {crop_c} colonne(s) retirées de chaque côté")
+if AUTO_EDGE_CROP:
+    img, (top, bottom, left, right) = auto_edge_crop(
+        img, max_crop_fraction=MAX_EDGE_CROP_PERCENT,
+        std_factor=EDGE_STD_FACTOR, mean_factor=EDGE_MEAN_FACTOR,
+        consecutive_good_required=EDGE_CONSECUTIVE_GOOD_REQUIRED
+    )
+    if top or bottom or left or right:
+        # Les dimensions physiques suivent la fraction réellement rognée sur chaque axe
+        width_mm *= (n_cols_raw - left - right) / n_cols_raw
+        height_mm *= (n_rows_raw - top - bottom) / n_rows_raw
+        print(f"Rognage adaptatif : haut={top}, bas={bottom}, gauche={left}, droite={right} px")
+        for side_name, side_val in [("haut", top), ("bas", bottom), ("gauche", left), ("droite", right)]:
+            if side_val >= int((n_rows_raw if side_name in ("haut", "bas") else n_cols_raw) * MAX_EDGE_CROP_PERCENT):
+                print(f"  ATTENTION : côté '{side_name}' rogné au maximum autorisé "
+                      f"({MAX_EDGE_CROP_PERCENT*100:.0f}%) — l'artefact dépasse peut-être encore. "
+                      f"Augmente MAX_EDGE_CROP_PERCENT si besoin.")
 
 if APPLY_DESPIKE:
     img = despike_mad(img, kernel_size=DESPIKE_KERNEL_SIZE, threshold=DESPIKE_MAD_THRESHOLD)
