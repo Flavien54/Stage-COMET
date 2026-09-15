@@ -1,0 +1,213 @@
+"""
+==================================================
+Affichage carte surface TIFF en 3D - Version générique
+(s'adapte automatiquement aux fichiers "aligned" et
+ "roughness" en fonction du nom de fichier)
+Toutes les hauteurs sont affichées en MICROMÈTRES (µm).
+==================================================
+"""
+
+import re
+import os
+
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib import cm
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (nécessaire pour projection='3d')
+from scipy.ndimage import zoom, median_filter
+from tkinter import Tk, filedialog
+import tifffile
+
+# ==================================================
+# Paramètres de filtrage des artefacts de bord
+# ==================================================
+
+# 1) Rognage de bordure : % de lignes/colonnes retirées sur CHAQUE bord.
+#    Ex: 0.03 = on retire 3% en haut, 3% en bas, 3% à gauche, 3% à droite.
+#    Mets 0.0 pour désactiver.
+EDGE_CROP_PERCENT = 0.03
+
+# 2) Despike robuste (filtre médian + seuil MAD) : remplace les pixels
+#    trop éloignés de la médiane locale par cette médiane locale.
+#    Utile pour les pics résiduels qui ne sont pas seulement en bordure.
+APPLY_DESPIKE = True
+DESPIKE_KERNEL_SIZE = 5     # taille de la fenêtre médiane (impair, ex: 3, 5, 7)
+DESPIKE_MAD_THRESHOLD = 6.0  # nb de MAD au-delà duquel un pixel est considéré aberrant
+
+# ==================================================
+# Sélection fichier TIFF
+# ==================================================
+
+root = Tk()
+root.withdraw()
+filename = filedialog.askopenfilename(
+    title="Sélectionner la carte surface TIFF",
+    filetypes=[("TIFF files", "*.tif *.tiff")]
+)
+root.destroy()
+
+if not filename:
+    print("Aucun fichier sélectionné")
+    raise SystemExit
+
+print(f"Fichier chargé :\n{filename}")
+
+base_name = os.path.splitext(os.path.basename(filename))[0]
+
+# ==================================================
+# Détection du type de donnée (aligned / roughness)
+# à partir du nom de fichier
+# ==================================================
+# -> Ajoute simplement tes propres mots-clés dans les
+#    regex ci-dessous si tes fichiers utilisent une
+#    autre convention de nommage.
+
+if re.search(r"rough|rugo", base_name, re.IGNORECASE):
+    data_type = "roughness"
+elif re.search(r"align", base_name, re.IGNORECASE):
+    data_type = "aligned"
+else:
+    print(f'Type de donnée non détecté dans "{base_name}" -> "aligned" par défaut.')
+    data_type = "aligned"
+
+# Les deux types sont maintenant affichés en micromètres (µm).
+# Ajuste unit_factor si tes données brutes ne sont pas en mètres
+# (ex: déjà en µm -> mettre unit_factor = 1.0).
+unit_label = "µm"
+unit_factor = 1e6  # conversion m -> µm
+
+if data_type == "aligned":
+    type_label_fr = "Hauteur alignée"
+    type_label_titre = "aligned"
+else:  # roughness
+    type_label_fr = "Rugosité"
+    type_label_titre = "roughness"
+
+# Nom d'échantillon "propre" : on retire le mot-clé de type du nom de fichier
+sample_label = re.sub(r"[-_ ]?(aligned|rough|rugo).*", "", base_name, flags=re.IGNORECASE)
+if not sample_label:
+    sample_label = base_name
+
+
+def despike_mad(data: np.ndarray, kernel_size: int = 5, threshold: float = 6.0) -> np.ndarray:
+    """
+    Remplace les pixels aberrants par la médiane locale.
+    Un pixel est considéré aberrant si son écart à la médiane locale dépasse
+    `threshold` fois le MAD (Median Absolute Deviation) local, une mesure de
+    dispersion robuste aux valeurs extrêmes (contrairement à l'écart-type).
+    """
+    local_median = median_filter(data, size=kernel_size, mode="nearest")
+    residual = data - local_median
+    mad = np.median(np.abs(residual)) + 1e-9  # évite une division par 0
+    robust_z = np.abs(residual) / mad
+
+    cleaned = data.copy()
+    outlier_mask = robust_z > threshold
+    cleaned[outlier_mask] = local_median[outlier_mask]
+
+    n_outliers = np.count_nonzero(outlier_mask)
+    if n_outliers:
+        pct = 100 * n_outliers / data.size
+        print(f"Despike : {n_outliers} pixel(s) corrigé(s) ({pct:.2f}% de l'image)")
+    return cleaned
+
+# ==================================================
+# Lecture TIFF
+# ==================================================
+
+img = tifffile.imread(filename)
+if img.ndim > 2:
+    img = img[0]  # slice 1 si stack
+
+img = img.astype(np.float64)
+
+# Conversion selon le type de donnée détecté
+img = img * unit_factor
+
+# Gestion NaN
+if np.isnan(img).any():
+    mean_val = np.nanmean(img)
+    img = np.nan_to_num(img, nan=mean_val)
+
+# ==================================================
+# Filtrage des artefacts de bord
+# ==================================================
+
+width_mm = 34.96
+height_mm = 23.57
+
+n_rows_raw, n_cols_raw = img.shape
+
+if EDGE_CROP_PERCENT > 0:
+    crop_r = int(round(n_rows_raw * EDGE_CROP_PERCENT))
+    crop_c = int(round(n_cols_raw * EDGE_CROP_PERCENT))
+    if crop_r > 0 or crop_c > 0:
+        img = img[crop_r:n_rows_raw - crop_r, crop_c:n_cols_raw - crop_c]
+        # Les dimensions physiques suivent la même proportion que le rognage
+        width_mm *= (n_cols_raw - 2 * crop_c) / n_cols_raw
+        height_mm *= (n_rows_raw - 2 * crop_r) / n_rows_raw
+        print(f"Rognage bordure : {crop_r} ligne(s) / {crop_c} colonne(s) retirées de chaque côté")
+
+if APPLY_DESPIKE:
+    img = despike_mad(img, kernel_size=DESPIKE_KERNEL_SIZE, threshold=DESPIKE_MAD_THRESHOLD)
+
+# Sur-échantillonnage (bicubique, order=3)
+scale = 4
+img = zoom(img, scale, order=3)
+
+n_rows, n_cols = img.shape
+y = np.linspace(0, width_mm, n_cols)
+z = np.linspace(0, height_mm, n_rows)
+Y, Z = np.meshgrid(y, z)
+
+# ==================================================
+# Echelle couleur
+# ==================================================
+
+vmin = np.nanmin(img)
+vmax = np.nanmax(img)
+
+# ==================================================
+# Figure 3D - fond blanc classique
+# ==================================================
+
+fig_title = f"{sample_label} - Surface {type_label_titre} map"
+z_label_str = f"{type_label_fr} ({unit_label})"
+
+fig = plt.figure(figsize=(10, 7), facecolor="w")
+fig.canvas.manager.set_window_title(fig_title)
+ax = fig.add_subplot(111, projection="3d")
+ax.set_facecolor("w")
+
+# Sous-échantillonnage POUR L'AFFICHAGE UNIQUEMENT (données img intactes).
+# plot_surface devient très lourd / peut planter au-delà de quelques
+# centaines de milliers de points -> on vise ~300x300 points affichés max.
+max_points_per_axis = 300
+step_r = max(1, n_rows // max_points_per_axis)
+step_c = max(1, n_cols // max_points_per_axis)
+
+surf = ax.plot_surface(
+    Y[::step_r, ::step_c],
+    Z[::step_r, ::step_c],
+    img[::step_r, ::step_c],
+    cmap=cm.jet,
+    vmin=vmin, vmax=vmax,
+    linewidth=0,
+    antialiased=False,
+    rstride=1, cstride=1
+)
+
+cbar = fig.colorbar(surf, ax=ax, shrink=0.6, pad=0.1)
+cbar.set_label(z_label_str, color="k")
+cbar.ax.yaxis.set_tick_params(color="k")
+plt.setp(plt.getp(cbar.ax.axes, "yticklabels"), color="k")
+
+ax.set_xlabel("Y (mm)", color="k")
+ax.set_ylabel("Z (mm)", color="k")
+ax.set_zlabel(z_label_str, color="k")
+ax.set_title(fig_title, color="k", fontweight="bold")
+
+ax.view_init(elev=30, azim=45)
+
+plt.tight_layout()
+plt.show()
