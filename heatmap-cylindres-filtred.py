@@ -9,6 +9,8 @@
 
  Adapté aux ÉCHANTILLONS CYLINDRIQUES découpés en tranches de 90° :
    - crop automatique des bords (divergence capteur / bandes saturées)
+   - suppression des artefacts linéaires verticaux + interpolation
+   - lissage par filtre bilatéral (préserve les pics isolés)
 
  Les données brutes des TIFF sont en MÈTRES -> converties en µm à l'affichage.
 =============================================================================
@@ -20,20 +22,32 @@ import traceback
 
 import numpy as np
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 from tkinter import Tk, filedialog
 from scipy.ndimage import zoom as scipy_zoom
 from scipy.ndimage import map_coordinates
+from scipy.ndimage import (uniform_filter1d, median_filter, binary_closing,
+                           binary_opening, binary_dilation, label, find_objects)
+
+try:
+    from skimage.restoration import denoise_bilateral
+
+    _HAS_SKIMAGE = True
+except ImportError:
+    _HAS_SKIMAGE = False
+    print("[!] scikit-image non installé. Le filtre bilatéral ne sera pas disponible.")
+    print("    Installez-le avec : pip install scikit-image")
 
 try:
     import tifffile
+
     _HAS_TIFFFILE = True
 except ImportError:
     _HAS_TIFFFILE = False
     from PIL import Image
-
 
 # =============================================================================
 #                                   CONFIG
@@ -47,13 +61,33 @@ UNIT_FACTOR = 1e6
 UNIT_LABEL = "µm"
 
 PIXEL_SIZE_MM = None
-SAMPLE_WIDTH_MM = None
-SAMPLE_HEIGHT_MM = None
+SAMPLE_WIDTH_MM = 10.31
+SAMPLE_HEIGHT_MM = 6.94
 
-# --- Lissage --------------------------------------------------------------
+# --- Lissage bilatéral ----------------------------------------------------
+# Le filtre bilatéral lisse le bruit tout en préservant les contours et les pics.
+#
+# sigma_color   : contrôle la préservation des intensités.
+#                 Petit  -> préserve fortement les pics (mais lisse moins)
+#                 Grand  -> lisse plus mais peut atténuer les pics
+#                 Valeur typique : 0.05 à 0.2 (en échelle normalisée 0-1)
+#
+# sigma_spatial : contrôle la taille de la zone de lissage spatial.
+#                 Petit  -> lissage local (garde les détails)
+#                 Grand  -> lissage large (image plus douce)
+#                 Valeur typique : 2 à 10 (en pixels)
+#
+# win_size      : taille du voisinage (doit être impair).
+#                 Doit être >= 2 * sigma_spatial + 1
+#                 Valeur typique : 5, 7, 9, 11, 13
+#
+# SMOOTH_FACTOR : facteur d'upsampling final (pour lisser les transitions)
+
 APPLY_SMOOTHING = True
-SMOOTH_FACTOR = 4
-SMOOTH_ORDER = 3
+BILATERAL_SIGMA_COLOR = 0.10
+BILATERAL_SIGMA_SPATIAL = 5.0
+BILATERAL_WIN_SIZE = 11
+SMOOTH_FACTOR = 3
 MAX_SMOOTHED_PIXELS = 40_000_000
 
 # --- Crop des bords --------------------------------------------------------
@@ -64,21 +98,35 @@ MAX_SMOOTHED_PIXELS = 40_000_000
 #   "fraction" : crop fixe en fraction de la dimension (0-0.5).
 #   "pixels"   : crop fixe en nombre de pixels.
 CROP_ENABLED = True
-CROP_MODE = "auto"              # "auto", "fraction" ou "pixels"
+CROP_MODE = "auto"  # "auto", "fraction" ou "pixels"
 
 # --- Paramètres du crop AUTO ----------------------------------------------
-# Une ligne/colonne est considérée "aberrante" si sa médiane dépasse la
-# médiane globale de plus de AUTO_CROP_SIGMA * MAD_globale (écart-type robuste).
-# On retire ensuite ces lignes/colonnes, plus AUTO_CROP_MARGIN pixels de marge.
-AUTO_CROP_SIGMA = 3.0           # seuil de détection (en MAD robustes)
-AUTO_CROP_MARGIN = 5            # pixels de marge supplémentaires retirés
-AUTO_CROP_MAX_FRACTION = 0.25   # ne jamais retirer plus de 25 % d'un côté
+AUTO_CROP_SIGMA = 2.0
+AUTO_CROP_MARGIN = 15
+AUTO_CROP_MAX_FRACTION = 0.35
 
 # --- Paramètres du crop FRACTION / PIXELS ----------------------------------
-CROP_TOP = 0.05                 # 5 % en haut
-CROP_BOTTOM = 0.05              # 5 % en bas
-CROP_LEFT = 0.05                # 5 % à gauche
-CROP_RIGHT = 0.05               # 5 % à droite
+CROP_TOP = 0.15
+CROP_BOTTOM = 0.15
+CROP_LEFT = 0.03
+CROP_RIGHT = 0.03
+
+# --- Suppression des artefacts linéaires verticaux -------------------------
+ARTIFACT_REMOVAL = True
+# Ne traiter que les fichiers dont le nom contient l'une de ces chaînes
+# (None = tous). Les U-MM ont de vrais pores allongés : on les épargne.
+ARTIFACT_FILE_FILTER = ["-AB-"]
+
+ART_BG_WINDOW_MM = 0.20      # fenêtre du médian horizontal (> 2x largeur max d'une trace)
+ART_K_SIGMA = 3.5            # seuil de détection (sigma robuste). Baisser => plus sensible
+ART_CLOSE_MM = 0.30          # comble les trous verticaux dans les traits pointillés
+ART_MIN_HEIGHT_MM = 0.30     # hauteur minimale d'une trace
+ART_MAX_WIDTH_MM = 0.08      # largeur maximale d'une trace
+ART_MIN_ASPECT = 6.0         # hauteur / largeur minimale
+ART_MIN_FILL = 0.20          # taux de remplissage minimal (pixels "forts" / objet)
+ART_DILATE_MM = 0.02         # élargit le masque de chaque côté (mm)
+ART_V_MARGIN_MM = 0.12       # prolonge le masque en haut/bas (mm) : bouts pâles des traces
+ART_SAVE_MASK = False        # True => exporte aussi le masque en PNG (pour régler)
 
 # --- Déroulement cylindrique -----------------------------------------------
 UNWRAP_ENABLED = False
@@ -90,11 +138,6 @@ UNWRAP_N_ANGLES = 1440
 UNWRAP_N_RADII = 256
 
 # --- Barre de couleur ------------------------------------------------------
-# Calage automatique : percentiles robustes.
-#   1 - 99.5  : bon compromis (garde la dynamique utile ET laisse apparaître
-#               les pics intéressants sur les surfaces rugueuses type AB)
-#   2 - 98    : plus "serré" mais écrase la dynamique (max à ~40 µm)
-#  0.5 - 99.9 : proche du max absolu, peut être sensible aux outliers
 VRANGE_PERCENTILE_LOW = 1.0
 VRANGE_PERCENTILE_HIGH = 99.5
 
@@ -103,7 +146,12 @@ VMIN = None
 VMAX = None
 
 XLIM = None
-YLIM = None
+YLIM = (0.5, 2.7)
+
+# True => le tableau est découpé à la fenêtre XLIM/YLIM (les bords hors fenêtre
+# ne sont pas affichés). Si les données sont plus courtes que la fenêtre, elles
+# sont étirées pour la remplir : plus aucune zone blanche.
+FILL_AXES_LIMITS = True
 
 CMAP_ROUGHNESS = "jet"
 CMAP_ALIGNED = "jet"
@@ -120,6 +168,7 @@ AXIS_LABEL_FONTSIZE = 16
 TICK_FONTSIZE = 14
 CBAR_LABEL_FONTSIZE = 16
 CBAR_TICK_FONTSIZE = 14
+
 
 # =============================================================================
 #                              FIN DE LA CONFIG
@@ -210,7 +259,6 @@ def _detect_aberrant_edges(arr: np.ndarray):
 
     n_rows, n_cols = arr.shape
 
-    # Médianes par ligne et par colonne (en ignorant les NaN)
     row_meds = np.nanmedian(arr, axis=1)
     col_meds = np.nanmedian(arr, axis=0)
 
@@ -245,13 +293,11 @@ def _detect_aberrant_edges(arr: np.ndarray):
     left = count_from_start(col_meds, threshold_high, threshold_low, AUTO_CROP_MAX_FRACTION)
     right = count_from_end(col_meds, threshold_high, threshold_low, AUTO_CROP_MAX_FRACTION)
 
-    # Marge de sécurité
     top += AUTO_CROP_MARGIN
     bottom += AUTO_CROP_MARGIN
     left += AUTO_CROP_MARGIN
     right += AUTO_CROP_MARGIN
 
-    # Ne pas dépasser 1/3 de chaque dimension
     top = min(top, n_rows // 3)
     bottom = min(bottom, n_rows // 3)
     left = min(left, n_cols // 3)
@@ -289,6 +335,113 @@ def crop_borders(arr: np.ndarray) -> np.ndarray:
     print(f"  [i] Crop ({CROP_MODE}) : {arr.shape} -> {cropped.shape} "
           f"(t={top}, b={bottom}, l={left}, r={right})")
     return cropped
+
+
+# =============================================================================
+#                  SUPPRESSION DES ARTEFACTS VERTICAUX
+# =============================================================================
+
+def _odd(n: int) -> int:
+    n = int(max(3, round(n)))
+    return n if n % 2 == 1 else n + 1
+
+
+def detect_vertical_artifacts(arr: np.ndarray) -> np.ndarray:
+    """
+    Retourne un masque booléen des traces fines verticales négatives.
+    Deux détecteurs combinés :
+      A) par forme : objets fins et allongés (après retrait des parties larges)
+      B) par profil de colonne : colonnes avec un excès de pixels très négatifs
+         (rattrape les traces collées à un pore/blob).
+    """
+    n_rows, n_cols = arr.shape
+    px = SAMPLE_WIDTH_MM / n_cols          # taille de pixel approx. en Y
+    pz = SAMPLE_HEIGHT_MM / n_rows         # taille de pixel approx. en Z
+
+    filled = np.nan_to_num(arr, nan=np.nanmedian(arr))
+
+    # fond local (médian horizontal) et résidu
+    win = _odd(ART_BG_WINDOW_MM / px)
+    bg = median_filter(filled, size=(1, win), mode="reflect")
+    res = filled - bg
+    sigma = _robust_sigma(res.ravel())
+    if sigma <= 0:
+        return np.zeros_like(arr, dtype=bool)
+    strong = res < -ART_K_SIGMA * sigma
+
+    max_w = max(2, int(round(ART_MAX_WIDTH_MM / px)))
+    close_len = _odd(ART_CLOSE_MM / pz)
+    min_h = ART_MIN_HEIGHT_MM / pz
+
+    mask = np.zeros(arr.shape, dtype=bool)
+
+    # --- A) détecteur par forme -------------------------------------------
+    sd = binary_dilation(strong, structure=np.ones((1, 3), bool))
+    cand = binary_closing(sd, structure=np.ones((close_len, 1), bool))
+    wide = binary_opening(cand, structure=np.ones((1, max_w + 1), bool))
+    wide = binary_dilation(wide, structure=np.ones((1, 3), bool))
+    cand &= ~wide
+    lab, n = label(cand)
+    for i, sl in enumerate(find_objects(lab), start=1):
+        h = sl[0].stop - sl[0].start
+        w = sl[1].stop - sl[1].start
+        if h < min_h or h / max(w, 1) < ART_MIN_ASPECT:
+            continue
+        obj = lab[sl] == i
+        fill = (strong[sl] & obj).sum() / max(obj.sum(), 1)
+        if fill < ART_MIN_FILL:
+            continue
+        mask[sl] |= obj
+
+    # --- B) détecteur par profil de colonne -------------------------------
+    cnt = uniform_filter1d(strong.sum(axis=0).astype(float), 3, mode="nearest") * 3
+    base = median_filter(cnt, size=_odd(0.3 / px), mode="reflect")
+    excess = cnt - base
+    clab, cn = label(excess >= 0.5 * min_h)
+    for csl in find_objects(clab):
+        ex = excess[csl[0]]
+        keep = np.nonzero(ex >= 0.5 * ex.max())[0]
+        c0 = max(csl[0].start + keep.min() - 1, 0)
+        c1 = min(csl[0].start + keep.max() + 2, n_cols)
+        rows = strong[:, c0:c1].any(axis=1)
+        rows = binary_closing(rows, structure=np.ones(close_len, bool))
+        rl, rn = label(rows)
+        for rsl in find_objects(rl):
+            if (rsl[0].stop - rsl[0].start) >= min_h:
+                mask[rsl[0], c0:c1] = True
+
+    # --- élargit pour couvrir les bords et les bouts pâles des traces -----
+    dx = max(1, int(round(ART_DILATE_MM / px)))
+    dz = max(0, int(round(ART_V_MARGIN_MM / pz)))
+    mask = binary_dilation(mask, structure=np.ones((2 * dz + 1, 2 * dx + 1), bool))
+    return mask
+
+
+def inpaint_rows(arr: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Interpolation linéaire horizontale des pixels masqués, ligne par ligne."""
+    out = arr.copy()
+    xs = np.arange(arr.shape[1])
+    for r in np.nonzero(mask.any(axis=1))[0]:
+        bad = mask[r] | ~np.isfinite(arr[r])
+        good = ~bad
+        if good.sum() < 2:
+            continue
+        out[r, bad] = np.interp(xs[bad], xs[good], arr[r, good])
+    return out
+
+
+def remove_artifacts(arr: np.ndarray, base_name: str = "",
+                     save_mask_path: str = None) -> np.ndarray:
+    if not ARTIFACT_REMOVAL:
+        return arr
+    if ARTIFACT_FILE_FILTER and not any(k in base_name for k in ARTIFACT_FILE_FILTER):
+        return arr
+    mask = detect_vertical_artifacts(arr)
+    print(f"  [i] Artefacts : {mask.sum()} px masqués "
+          f"({100 * mask.mean():.2f} %)")
+    if save_mask_path and ART_SAVE_MASK:
+        plt.imsave(save_mask_path, mask, cmap="gray")
+    return inpaint_rows(arr, mask)
 
 
 # =============================================================================
@@ -364,25 +517,65 @@ def maybe_unwrap(arr: np.ndarray, path: str):
 # =============================================================================
 
 def smooth_upsample(arr: np.ndarray) -> np.ndarray:
+    """
+    Applique un filtre bilatéral pour lisser l'image tout en préservant
+    les contours et les pics isolés.
+
+    Le filtre bilatéral combine :
+      - Un filtre spatial (sigma_spatial) : moyenne les pixels proches
+      - Un filtre d'intensité (sigma_color) : ne moyenne que les pixels
+        ayant une valeur similaire
+
+    Résultat : les zones uniformes sont lissées, mais les transitions
+    nettes (pics, bords) sont conservées.
+    """
     if not APPLY_SMOOTHING:
         return arr
 
+    if not _HAS_SKIMAGE:
+        print("  [!] scikit-image non disponible -> lissage ignoré.")
+        return arr
+
+    # Gestion des NaN
     if np.isnan(arr).any():
         mean_val = np.nanmean(arr)
         arr = np.nan_to_num(arr, nan=mean_val)
 
-    n_rows, n_cols = arr.shape
+    # Normalisation pour le filtre bilatéral (qui attend des valeurs [0,1])
+    vmin, vmax = arr.min(), arr.max()
+    if vmax - vmin < 1e-12:
+        return arr
+    arr_norm = (arr - vmin) / (vmax - vmin)
+
+    # --- Application du filtre bilatéral ---
+    arr_filtered = denoise_bilateral(
+        arr_norm,
+        sigma_color=BILATERAL_SIGMA_COLOR,
+        sigma_spatial=BILATERAL_SIGMA_SPATIAL,
+        win_size=BILATERAL_WIN_SIZE,
+        mode='reflect',
+    )
+
+    # Dénormalisation
+    arr_filtered = arr_filtered * (vmax - vmin) + vmin
+
+    # Clip pour éviter les valeurs hors plage (affichées comme transparentes
+    # par matplotlib).
+    arr_filtered = np.clip(arr_filtered, vmin, vmax)
+
+    # --- Upsampling final pour lisser les transitions ---
+    n_rows, n_cols = arr_filtered.shape
     factor = SMOOTH_FACTOR
     total_pixels = (n_rows * factor) * (n_cols * factor)
     if total_pixels > MAX_SMOOTHED_PIXELS:
         max_factor_sq = MAX_SMOOTHED_PIXELS / (n_rows * n_cols)
         factor = max(1.0, max_factor_sq ** 0.5)
-        print(f"  [i] Facteur de lissage réduit à {factor:.2f}.")
+        print(f"  [i] Facteur d'upsampling réduit à {factor:.2f}.")
 
-    if factor <= 1:
-        return arr
+    if factor > 1:
+        arr_filtered = scipy_zoom(arr_filtered, factor, order=1)
 
-    return scipy_zoom(arr, factor, order=SMOOTH_ORDER)
+    return arr_filtered
 
 
 def get_pixel_size_from_metadata(path: str):
@@ -476,22 +669,42 @@ def get_effective_dpi(figsize):
 
 def get_vrange(arr: np.ndarray):
     """
-    Calcule (vmin, vmax) en utilisant des percentiles robustes.
-    Affiche aussi quelques stats (min, médiane, max, percentiles) pour
-    diagnostiquer le calage de la colorbar.
+    Calcule (vmin, vmax) de manière automatique et robuste.
+
+    Utilise l'écart interquartile (IQR) pour détecter les valeurs aberrantes
+    et les ignorer, sans avoir à ajuster manuellement les percentiles.
     """
     finite = arr[np.isfinite(arr)]
     if finite.size == 0:
         return 0.0, 1.0
 
-    vmin = VMIN if VMIN is not None else float(np.percentile(finite, VRANGE_PERCENTILE_LOW))
-    vmax = VMAX if VMAX is not None else float(np.percentile(finite, VRANGE_PERCENTILE_HIGH))
+    # Si VMIN/VMAX sont forcés dans la config, on les utilise
+    if VMIN is not None and VMAX is not None:
+        return float(VMIN), float(VMAX)
+
+    # --- Calcul automatique basé sur l'IQR ---
+    q1 = np.percentile(finite, 25)
+    q3 = np.percentile(finite, 75)
+    iqr = q3 - q1
+
+    # Limites statistiques (méthode de Tukey), facteur large (3.0) pour ne
+    # pas trop couper les pics intéressants.
+    FACTOR = 3.0
+
+    vmin_auto = q1 - FACTOR * iqr
+    vmax_auto = q3 + FACTOR * iqr
+
+    # On s'assure de ne pas dépasser les bornes réelles des données
+    vmin_auto = max(vmin_auto, finite.min())
+    vmax_auto = min(vmax_auto, finite.max())
+
+    # Si VMIN ou VMAX est forcé individuellement, on respecte le choix
+    vmin = VMIN if VMIN is not None else vmin_auto
+    vmax = VMAX if VMAX is not None else vmax_auto
 
     # --- DEBUG : stats pour comprendre le calage ---
     print(f"  [debug] min={finite.min():.2f}  "
-          f"p{VRANGE_PERCENTILE_LOW}={np.percentile(finite, VRANGE_PERCENTILE_LOW):.2f}  "
-          f"med={np.median(finite):.2f}  "
-          f"p{VRANGE_PERCENTILE_HIGH}={np.percentile(finite, VRANGE_PERCENTILE_HIGH):.2f}  "
+          f"Q1={q1:.2f}  med={np.median(finite):.2f}  Q3={q3:.2f}  "
           f"max={finite.max():.2f}  "
           f"-> vmin={vmin:.2f}  vmax={vmax:.2f}")
 
@@ -500,10 +713,50 @@ def get_vrange(arr: np.ndarray):
     return vmin, vmax
 
 
+def crop_to_window(arr: np.ndarray, extent):
+    """
+    Découpe le tableau à la fenêtre XLIM/YLIM (en mm), au lieu d'étirer tout
+    le tableau dedans : les bords (bandes bleues, bouts de traces) situés hors
+    fenêtre ne sont ni affichés ni pris en compte dans l'échelle de couleurs.
+
+    Si le tableau est plus court que la fenêtre (ex. échantillon plus petit),
+    la partie disponible est étirée pour remplir toute la fenêtre -> pas de blanc.
+    """
+    n_rows, n_cols = arr.shape
+    x_left, x_right, y_bot, y_top = extent
+    dx = (x_right - x_left) / n_cols
+    dz = (y_bot - y_top) / n_rows
+
+    r0, r1, c0, c1 = 0, n_rows, 0, n_cols
+    new_x0, new_x1, new_y0, new_y1 = x_left, x_right, y_top, y_bot
+
+    if YLIM is not None and dz > 0:
+        z0 = max(min(YLIM), y_top)
+        z1 = min(max(YLIM), y_bot)
+        if z1 > z0:
+            r0 = int(round((z0 - y_top) / dz))
+            r1 = int(round((z1 - y_top) / dz))
+            new_y0, new_y1 = min(YLIM), max(YLIM)   # remplit toute la fenêtre
+    if XLIM is not None and dx > 0:
+        x0 = max(min(XLIM), x_left)
+        x1 = min(max(XLIM), x_right)
+        if x1 > x0:
+            c0 = int(round((x0 - x_left) / dx))
+            c1 = int(round((x1 - x_left) / dx))
+            new_x0, new_x1 = min(XLIM), max(XLIM)
+
+    if r1 - r0 < 2 or c1 - c0 < 2:
+        return arr, extent
+    print(f"  [i] Fenêtre : lignes {r0}:{r1} / {n_rows}, colonnes {c0}:{c1} / {n_cols}")
+    return arr[r0:r1, c0:c1], (new_x0, new_x1, new_y1, new_y0)
+
+
 def plot_tiff_to_png(tiff_path: str, output_folder: str):
     filename = os.path.basename(tiff_path)
     base_name = os.path.splitext(filename)[0]
     file_type = detect_file_type(filename)
+
+    os.makedirs(output_folder, exist_ok=True)
 
     # --- Chargement ---
     arr = load_tiff(tiff_path)
@@ -511,11 +764,19 @@ def plot_tiff_to_png(tiff_path: str, output_folder: str):
     # --- Crop des bords aberrants ---
     arr = crop_borders(arr)
 
+    # --- Suppression des artefacts verticaux (AVANT get_vrange) ---
+    arr = remove_artifacts(
+        arr, base_name, os.path.join(output_folder, base_name + "_mask.png"))
+
     # --- Déroulement cylindrique éventuel ---
     arr, extent_override = maybe_unwrap(arr, tiff_path)
 
     # --- Extent, plage de couleurs, lissage ---
     extent, is_mm = resolve_extent(tiff_path, arr, extent_override=extent_override)
+
+    if FILL_AXES_LIMITS and extent_override is None:
+        arr, extent = crop_to_window(arr, extent)
+
     vmin, vmax = get_vrange(arr)
     arr_plot = smooth_upsample(arr)
     figsize = compute_figsize(extent)
@@ -562,21 +823,26 @@ def plot_tiff_to_png(tiff_path: str, output_folder: str):
     ax.set_title(title, fontsize=TITLE_FONTSIZE, fontweight="bold")
     ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
 
-    if XLIM is not None:
-        ax.set_xlim(XLIM)
-    if YLIM is not None:
-        ax.set_ylim(max(YLIM), min(YLIM))
+    # Les limites d'axes sont bornées à l'étendue réelle des données :
+    # si l'échantillon est plus court que YLIM (après crop auto), on n'affiche
+    # pas de zone blanche vide.
+    if extent_override is None:
+        x_lo, x_hi = sorted((extent[0], extent[1]))
+        y_lo, y_hi = sorted((extent[3], extent[2]))
+        if XLIM is not None:
+            ax.set_xlim(max(min(XLIM), x_lo), min(max(XLIM), x_hi))
+        if YLIM is not None:
+            ax.set_ylim(min(max(YLIM), y_hi), max(min(YLIM), y_lo))
 
     # --- colorbar ---
     if COLORBAR_ORIENTATION == "horizontal":
         cbar = fig.colorbar(im, ax=ax, orientation="horizontal", location="bottom",
-                             fraction=0.08, pad=0.12, shrink=0.9)
+                            fraction=0.08, pad=0.12, shrink=0.9)
     else:
         cbar = fig.colorbar(im, ax=ax, orientation="vertical", fraction=0.046, pad=0.04)
     cbar.set_label(cbar_label, fontsize=CBAR_LABEL_FONTSIZE)
     cbar.ax.tick_params(labelsize=CBAR_TICK_FONTSIZE)
 
-    os.makedirs(output_folder, exist_ok=True)
     out_path = os.path.join(output_folder, base_name + ".png")
     fig.savefig(out_path, dpi=effective_dpi, bbox_inches="tight", pad_inches=0.2)
     plt.close(fig)
