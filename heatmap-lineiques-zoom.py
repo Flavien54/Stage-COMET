@@ -4,14 +4,14 @@
 =============================================================================
  tiff_to_png.py
 -----------------------------------------------------------------------------
- Lit tous les fichiers .tif / .tiff d'un dossier, les visualise (heatmap)
- selon leur type détecté à partir du nom de fichier :
+ Lit un fichier .tif/.tiff (mode "single") ou tous les fichiers d'un
+ dossier (mode "batch"), les visualise (heatmap) selon leur type détecté à
+ partir du nom de fichier :
      - "roughness"  -> carte de rugosité (colormap divergente centrée sur 0)
      - "aligned"    -> surface alignée (colormap séquentielle)
  puis exporte chaque figure en PNG dans un dossier de sortie.
 
- Les données brutes des TIFF sont en MÈTRES -> converties en µm à l'affichage
- (comme dans le script de référence : unit_factor = 1e6).
+ Les données brutes des TIFF sont en MÈTRES -> converties en µm à l'affichage.
 
  Pipeline de lissage :
      1) Débruitage (filtre gaussien ou médian) pour effacer le "grillage"
@@ -19,10 +19,11 @@
      2) Sur-échantillonnage bicubique pour un rendu lisse.
 
  Options réglables manuellement en haut du script (section CONFIG) :
+     - PROCESS_MODE / INPUT_FILE : mode single ou batch
      - DENOISE_METHOD / DENOISE_SIGMA / DENOISE_SIZE : débruitage
      - SMOOTH_FACTOR / SMOOTH_ORDER : sur-échantillonnage
      - VMIN / VMAX : plage de la barre de couleur (en µm), scalaires
-     - XLIM / YLIM : zoom manuel, tuples de coordonnées (xmin, xmax) / (ymin, ymax)
+     - XLIM / YLIM : zoom manuel, tuples de coordonnées
      - PIXEL_SIZE_MM : taille de pixel pour convertir les axes X/Y en mm
 =============================================================================
 """
@@ -52,90 +53,68 @@ except ImportError:
 #                                   CONFIG
 # =============================================================================
 
-# --- Dossiers ----------------------------------------------------------------
-# Laisser à None : une fenêtre s'ouvrira au lancement du script pour choisir
-# le dossier d'entrée puis le dossier de sortie.
+# --- Dossiers / fichiers ------------------------------------------------------
+# Laisser à None : une fenêtre s'ouvrira au lancement du script.
 INPUT_FOLDER = None            # ex : r"C:\Users\moi\Desktop\TIFF_a_traiter"
+INPUT_FILE = None              # ex : r"C:\Users\moi\Desktop\image.tif"  (mode single)
 OUTPUT_FOLDER = None           # ex : r"C:\Users\moi\Desktop\PNG_export"
 RECURSIVE = False              # chercher aussi dans les sous-dossiers ?
 
+# "single" (une seule image), "batch" (tout un dossier)
+# ou None => une fenêtre demande le mode à chaque lancement.
+PROCESS_MODE = None
+
 # --- Unité des données brutes -------------------------------------------------
-# Les TIFF contiennent des hauteurs en MÈTRES -> conversion vers µm à l'affichage.
 UNIT_FACTOR = 1e6      # m -> µm (mettre 1.0 si les données sont déjà en µm)
 UNIT_LABEL = "µm"
 
 # --- Taille de pixel / dimensions physiques -----------------------------------
-# Utilisées pour afficher les axes X/Y en mm. Le script essaie dans l'ordre :
-#   1) PIXEL_SIZE_MM ci-dessous, si renseigné (mm/pixel, pixels carrés) ;
-#   2) les métadonnées du TIFF (tags XResolution/ResolutionUnit), si présentes ;
-#   3) SAMPLE_WIDTH_MM / SAMPLE_HEIGHT_MM ci-dessous, si renseignées ;
-#   4) à défaut, axes affichés en pixels (avec avertissement dans la console).
+# Ordre de priorité :
+#   1) PIXEL_SIZE_MM si renseigné ;
+#   2) métadonnées TIFF (XResolution / ResolutionUnit) si présentes ;
+#   3) SAMPLE_WIDTH_MM / SAMPLE_HEIGHT_MM si renseignés ;
+#   4) sinon axes en pixels.
 #
-# ⚠️ ATTENTION au ratio : si tu utilises SAMPLE_WIDTH_MM / SAMPLE_HEIGHT_MM,
-# le rapport SAMPLE_WIDTH_MM / SAMPLE_HEIGHT_MM DOIT être égal à n_cols / n_rows
-# du TIFF, sinon imshow laisse des bandes blanches (aspect="equal").
-# En cas de doute, laisse ces deux variables à None : le script calcule
-# automatiquement depuis les métadonnées ou affiche en pixels.
-PIXEL_SIZE_MM = None          # ex : 0.05  (=> 1 pixel = 0.05 mm)
-SAMPLE_WIDTH_MM = None        # ex : 20.0  (largeur physique totale, axe Y)
-SAMPLE_HEIGHT_MM = None       # ex : 3.5   (hauteur physique totale, axe Z)
-                              # ⚠️ doit respecter : H = W * n_rows / n_cols
+# ⚠️ Si SAMPLE_WIDTH_MM / SAMPLE_HEIGHT_MM sont utilisés, leur rapport DOIT être
+# égal à n_cols / n_rows du TIFF, sinon imshow laisse des bandes blanches.
+PIXEL_SIZE_MM = None
+SAMPLE_WIDTH_MM = 40.52
+SAMPLE_HEIGHT_MM = 27.28
 
 # --- Lissage / sur-échantillonnage --------------------------------------------
-# Le "grillage" visible sur les cartes de rugosité est un bruit haute fréquence
-# (lignes de balayage du capteur). Pour l'éliminer :
-#   1) on applique un filtre gaussien (ou médian) qui écrase le bruit périodique
-#   2) PUIS on sur-échantillonne par interpolation bicubique pour un rendu doux.
 APPLY_SMOOTHING = True
 
 # --- Étape 1 : filtre anti-bruit ---------------------------------------------
-# DENOISE_METHOD : "gaussian" (rapide, recommandé), "median" (préserve les bords
-#                  mais plus lent), ou None pour désactiver.
-# DENOISE_SIGMA  : écart-type du flou gaussien, en pixels.
-#                  - 0.5 à 1.0 : léger (enlève le grain fin)
-#                  - 1.5 à 3.0 : fort (enlève le grillage / lignes de balayage)
-#                  - >3        : très fort (risque de lisser les vraies features)
-# DENOISE_SIZE   : taille du noyau pour le filtre médian (impair : 3, 5, 7...).
 DENOISE_METHOD = "gaussian"     # "gaussian", "median", ou None
 DENOISE_SIGMA = 1.5             # utilisé si method == "gaussian"
 DENOISE_SIZE = 3                # utilisé si method == "median"
 
 # --- Étape 2 : sur-échantillonnage (rendu doux) ------------------------------
-SMOOTH_FACTOR = 4               # facteur d'agrandissement
-SMOOTH_ORDER = 3                # 3 = bicubique
+SMOOTH_FACTOR = 4
+SMOOTH_ORDER = 3
 MAX_SMOOTHED_PIXELS = 40_000_000
 
 # --- Plage de la barre de couleur (colorbar), en µm ---------------------------
-# None = calage automatique (percentiles 1-99 des données).
-# VMIN et VMAX sont des SCALAIRES (en µm).
 VMIN = None            # ex : -100
 VMAX = None            # ex : 100
 
 # --- Zoom manuel ---------------------------------------------------------------
-# XLIM et YLIM sont des TUPLES de coordonnées dans les unités des axes :
-#   - en mm si PIXEL_SIZE_MM ou SAMPLE_WIDTH_MM/SAMPLE_HEIGHT_MM est défini,
-#   - en pixels sinon.
-# None = pas de zoom (vue complète).
-XLIM = (6,20)           # ex : (5.0, 20.0)  -> (xmin, xmax) sur l'axe horizontal (Y)
-YLIM = (0,3.5)           # ex : (0.0, 10.0)  -> (ymin, ymax) sur l'axe vertical   (Z)
+XLIM = (6, 20)          # (xmin, xmax) sur l'axe horizontal (Y)
+YLIM = (0, 3.5)         # (ymin, ymax) sur l'axe vertical   (Z)
 
 # --- Colormaps -----------------------------------------------------------------
-CMAP_ROUGHNESS = "jet"        # colormap divergente, centrée automatiquement sur 0
-CMAP_ALIGNED = "jet"          # colormap séquentielle pour la surface alignée
+CMAP_ROUGHNESS = "jet"
+CMAP_ALIGNED = "jet"
 
 # --- Colorbar -------------------------------------------------------------------
 COLORBAR_ORIENTATION = "horizontal"   # "horizontal" ou "vertical"
 
 # --- Habillage des figures ------------------------------------------------------
 DPI = 200
-
-# Taille de figure : la plus grande dimension est fixée à TARGET_LONG_SIDE_INCHES,
-# l'autre suit le ratio des données, avec un minimum MIN_SHORT_SIDE_INCHES.
 TARGET_LONG_SIDE_INCHES = 16.0
 MIN_SHORT_SIDE_INCHES = 9.0
 MAX_PIXELS_DIM = 20000
 
-# --- Tailles de police (en points) -----------------------------------------------
 TITLE_FONTSIZE = 20
 AXIS_LABEL_FONTSIZE = 16
 TICK_FONTSIZE = 14
@@ -157,29 +136,87 @@ def select_folder(title: str) -> str:
     return folder
 
 
-def resolve_folders():
-    """
-    Détermine le dossier d'entrée et le dossier de sortie :
-    - si INPUT_FOLDER / OUTPUT_FOLDER sont renseignés en dur, on les utilise
-      directement (pas de fenêtre) ;
-    - sinon, on ouvre une fenêtre de sélection pour chacun.
-    """
-    input_folder = INPUT_FOLDER
-    output_folder = OUTPUT_FOLDER
+def select_file(title: str) -> str:
+    """Boîte de dialogue pour choisir un seul fichier TIFF."""
+    root = Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askopenfilename(
+        title=title,
+        filetypes=[("Fichiers TIFF", "*.tif *.tiff *.TIF *.TIFF"),
+                   ("Tous les fichiers", "*.*")],
+    )
+    root.destroy()
+    return path
 
-    if not input_folder:
-        input_folder = select_folder("Sélectionner le dossier contenant les fichiers TIFF")
+
+def ask_mode() -> str:
+    """Petite fenêtre : une seule image ou batch. Retourne 'single', 'batch' ou None."""
+    from tkinter import Label, Button, Frame
+
+    root = Tk()
+    root.title("Mode de traitement")
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+    choice = {"value": None}
+
+    def pick(value):
+        choice["value"] = value
+        root.destroy()
+
+    Label(root, text="Que souhaitez-vous traiter ?",
+          font=("Arial", 12, "bold"), padx=20, pady=15).pack()
+
+    frame = Frame(root, padx=20, pady=10)
+    frame.pack()
+    Button(frame, text="Une seule image", width=20, height=2,
+           command=lambda: pick("single")).grid(row=0, column=0, padx=8)
+    Button(frame, text="Batch (tout un dossier)", width=20, height=2,
+           command=lambda: pick("batch")).grid(row=0, column=1, padx=8)
+
+    root.protocol("WM_DELETE_WINDOW", lambda: pick(None))
+    root.mainloop()
+    return choice["value"]
+
+
+def resolve_inputs():
+    """
+    Retourne (mode, tiff_files, output_folder).
+      - mode 'single' : tiff_files contient un seul fichier
+      - mode 'batch'  : tiff_files contient tous les TIFF du dossier
+    """
+    mode = PROCESS_MODE
+    if mode is None and INPUT_FILE:
+        mode = "single"            # un fichier est déjà fixé dans la config
+    if mode is None:
+        mode = ask_mode()
+    if mode not in ("single", "batch"):
+        print("Aucun mode sélectionné. Arrêt.")
+        raise SystemExit
+
+    if mode == "single":
+        path = INPUT_FILE or select_file("Sélectionner le fichier TIFF à traiter")
+        if not path:
+            print("Aucun fichier sélectionné. Arrêt.")
+            raise SystemExit
+        print(f"Mode : image unique -> {path}")
+        tiff_files = [path]
+    else:
+        input_folder = INPUT_FOLDER or select_folder(
+            "Sélectionner le dossier contenant les fichiers TIFF")
         if not input_folder:
             print("Aucun dossier d'entrée sélectionné. Arrêt.")
             raise SystemExit
+        print(f"Mode : batch -> lecture des .tif/.tiff dans : {input_folder}")
+        tiff_files = find_tiff_files(input_folder, RECURSIVE)
 
+    output_folder = OUTPUT_FOLDER or select_folder(
+        "Sélectionner le dossier de destination des PNG")
     if not output_folder:
-        output_folder = select_folder("Sélectionner le dossier de destination des PNG")
-        if not output_folder:
-            print("Aucun dossier de sortie sélectionné. Arrêt.")
-            raise SystemExit
+        print("Aucun dossier de sortie sélectionné. Arrêt.")
+        raise SystemExit
 
-    return input_folder, output_folder
+    return mode, tiff_files, output_folder
 
 
 def detect_file_type(filename: str) -> str:
@@ -194,7 +231,7 @@ def detect_file_type(filename: str) -> str:
 
 
 def load_tiff(path: str) -> np.ndarray:
-    """Charge un fichier .tif/.tiff en tableau numpy 2D (float), en mètres."""
+    """Charge un fichier .tif/.tiff en tableau numpy 2D (float), en µm."""
     if _HAS_TIFFFILE:
         arr = tifffile.imread(path)
     else:
@@ -205,9 +242,7 @@ def load_tiff(path: str) -> np.ndarray:
     if arr.ndim == 3:  # image multi-canaux -> on garde le 1er canal
         arr = arr[..., 0]
 
-    # Conversion m -> µm (ou facteur défini par l'utilisateur)
     arr = arr * UNIT_FACTOR
-
     return arr
 
 
@@ -219,7 +254,6 @@ def denoise(arr: np.ndarray) -> np.ndarray:
     if DENOISE_METHOD is None:
         return arr
 
-    # Remplace les NaN par la moyenne avant filtrage (sinon le filtre propage les NaN)
     if np.isnan(arr).any():
         mean_val = np.nanmean(arr)
         arr = np.nan_to_num(arr, nan=mean_val)
@@ -243,9 +277,6 @@ def smooth_upsample(arr: np.ndarray) -> np.ndarray:
     Pipeline complet :
       1) Débruitage (gaussien ou médian) pour effacer le grillage.
       2) Sur-échantillonnage bicubique pour un rendu lisse.
-
-    Le facteur de sur-échantillonnage est réduit automatiquement si le résultat
-    dépasserait MAX_SMOOTHED_PIXELS.
     """
     if not APPLY_SMOOTHING:
         return arr
@@ -270,10 +301,7 @@ def smooth_upsample(arr: np.ndarray) -> np.ndarray:
 
 
 def get_pixel_size_from_metadata(path: str):
-    """
-    Essaie de lire la taille de pixel (en mm) depuis les tags TIFF standards
-    (XResolution + ResolutionUnit). Retourne None si l'info n'est pas présente.
-    """
+    """Lit la taille de pixel (mm) depuis XResolution + ResolutionUnit."""
     if not _HAS_TIFFFILE:
         return None
     try:
@@ -294,10 +322,10 @@ def get_pixel_size_from_metadata(path: str):
             if not pixels_per_unit:
                 return None
 
-            unit_code = unit_tag.value if unit_tag is not None else 2  # 2 = inch
-            if unit_code == 2:      # pouce
+            unit_code = unit_tag.value if unit_tag is not None else 2
+            if unit_code == 2:
                 mm_per_unit = 25.4
-            elif unit_code == 3:    # centimètre
+            elif unit_code == 3:
                 mm_per_unit = 10.0
             else:
                 return None
@@ -320,11 +348,7 @@ def resolve_pixel_size_mm(path: str, arr: np.ndarray):
 
 
 def resolve_extent(path: str, arr: np.ndarray):
-    """
-    Détermine l'extent (xmin, xmax, ymin, ymax) à utiliser pour imshow, et si
-    les axes doivent être affichés en mm ou en pixels.
-    Retourne (extent, is_mm).
-    """
+    """Détermine l'extent (xmin, xmax, ymin, ymax) et si les axes sont en mm."""
     n_rows, n_cols = arr.shape
 
     pixel_size_mm = resolve_pixel_size_mm(path, arr)
@@ -334,24 +358,19 @@ def resolve_extent(path: str, arr: np.ndarray):
     if SAMPLE_WIDTH_MM is not None and SAMPLE_HEIGHT_MM is not None:
         return (0, SAMPLE_WIDTH_MM, SAMPLE_HEIGHT_MM, 0), True
 
-    print(f"  [!] Taille de pixel introuvable (ni PIXEL_SIZE_MM, ni métadonnées, "
-          f"ni SAMPLE_WIDTH_MM/SAMPLE_HEIGHT_MM) pour "
+    print(f"  [!] Taille de pixel introuvable pour "
           f"{os.path.basename(path)} -> axes affichés en pixels.")
     return (0, n_cols, n_rows, 0), False
 
 
 def compute_figsize(extent):
-    """
-    Calcule une taille de figure (largeur, hauteur en pouces) en respectant le
-    ratio largeur/hauteur des données, avec la plus grande dimension fixée à
-    TARGET_LONG_SIDE_INCHES.
-    """
+    """Taille de figure en respectant le ratio des données."""
     x_span = abs(extent[1] - extent[0])
     y_span = abs(extent[2] - extent[3])
     if x_span == 0 or y_span == 0:
         return (TARGET_LONG_SIDE_INCHES, TARGET_LONG_SIDE_INCHES * 3 / 4)
 
-    ratio = x_span / y_span  # > 1 si plus large que haut
+    ratio = x_span / y_span
 
     if ratio >= 1:
         width = TARGET_LONG_SIDE_INCHES
@@ -370,10 +389,7 @@ def compute_figsize(extent):
 
 
 def get_effective_dpi(figsize):
-    """
-    Réduit le DPI si nécessaire pour que la plus grande dimension du PNG final
-    ne dépasse pas MAX_PIXELS_DIM pixels.
-    """
+    """Réduit le DPI pour que la plus grande dimension ne dépasse pas MAX_PIXELS_DIM."""
     largest_inches = max(figsize)
     dpi = DPI
     if largest_inches * dpi > MAX_PIXELS_DIM:
@@ -382,11 +398,7 @@ def get_effective_dpi(figsize):
 
 
 def get_vrange(arr: np.ndarray):
-    """
-    Retourne (vmin, vmax) à utiliser pour la colorbar, en µm.
-    - VMIN et VMAX (CONFIG) sont des scalaires.
-    - Si l'un des deux est None, on utilise le percentile 1 ou 99 des données.
-    """
+    """Retourne (vmin, vmax) en µm."""
     vmin = VMIN if VMIN is not None else float(np.nanpercentile(arr, 1))
     vmax = VMAX if VMAX is not None else float(np.nanpercentile(arr, 99))
     return vmin, vmax
@@ -411,7 +423,6 @@ def plot_tiff_to_png(tiff_path: str, output_folder: str):
     fig, ax = plt.subplots(figsize=figsize, dpi=effective_dpi)
 
     if file_type == "roughness":
-        # colormap divergente centrée sur 0
         norm = TwoSlopeNorm(vmin=vmin, vcenter=0, vmax=vmax) if vmin < 0 < vmax else None
         im = ax.imshow(
             arr_plot, cmap=CMAP_ROUGHNESS, extent=extent, aspect="equal",
@@ -447,7 +458,7 @@ def plot_tiff_to_png(tiff_path: str, output_folder: str):
     ax.set_title(title, fontsize=TITLE_FONTSIZE, fontweight="bold")
     ax.tick_params(axis="both", labelsize=TICK_FONTSIZE)
 
-    # --- zoom manuel -----------------------------------------------------------
+    # --- zoom manuel ---
     if XLIM is not None:
         xmin, xmax = XLIM
         if xmin < xmax:
@@ -457,7 +468,6 @@ def plot_tiff_to_png(tiff_path: str, output_folder: str):
     if YLIM is not None:
         ymin, ymax = YLIM
         if ymin < ymax:
-            # axe Y inversé (origine en haut) : on respecte l'ordre demandé
             ax.set_ylim(max(ymin, ymax), min(ymin, ymax))
         else:
             print(f"  [!] YLIM={YLIM} invalide (ymin >= ymax) -> ignoré.")
@@ -491,30 +501,29 @@ def find_tiff_files(input_folder: str, recursive: bool = False):
 
 
 def main():
-    input_folder, output_folder = resolve_folders()
-
-    print(f"Lecture des fichiers .tif/.tiff dans : {input_folder}")
-    tiff_files = find_tiff_files(input_folder, RECURSIVE)
+    mode, tiff_files, output_folder = resolve_inputs()
 
     if not tiff_files:
         print("Aucun fichier .tif/.tiff trouvé.")
         return
 
-    print(f"{len(tiff_files)} fichier(s) trouvé(s).\n")
+    print(f"{len(tiff_files)} fichier(s) à traiter.\n")
 
     n_ok, n_fail = 0, 0
     for path in tiff_files:
+        print(f"--- Traitement de {os.path.basename(path)} ---")
         try:
             out_path = plot_tiff_to_png(path, output_folder)
             file_type = detect_file_type(os.path.basename(path))
-            print(f"[OK] {os.path.basename(path)}  (type={file_type})  -> {out_path}")
+            print(f"[OK] {os.path.basename(path)}  (type={file_type})  -> {out_path}\n")
             n_ok += 1
         except Exception as e:
             print(f"[ERREUR] {os.path.basename(path)} : {e}")
             traceback.print_exc()
             n_fail += 1
+            print()
 
-    print(f"\nTerminé : {n_ok} succès, {n_fail} échec(s).")
+    print(f"Terminé : {n_ok} succès, {n_fail} échec(s).")
     print(f"PNG exportés dans : {output_folder}")
 
 
