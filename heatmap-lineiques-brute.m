@@ -2,217 +2,249 @@ function tiff_to_png()
 %==========================================================================
 % tiff_to_png.m
 %--------------------------------------------------------------------------
-% Lit tous les fichiers .tif / .tiff d'un dossier, les visualise (heatmap)
-% selon leur type détecté à partir du nom de fichier :
-%     - "roughness"  -> carte de rugosité (colormap divergente centrée sur 0)
-%     - "aligned"    -> surface alignée (colormap séquentielle)
-% puis exporte chaque figure en PNG dans un dossier de sortie.
+% Lit un fichier .tif/.tiff (mode "single") ou tous les fichiers d'un
+% dossier (mode "batch"), les visualise (heatmap) selon leur type détecté à
+% partir du nom de fichier, puis exporte en PNG.
 %
-% Les données brutes des TIFF sont en MÈTRES -> converties en µm à
-% l'affichage (comme dans le script de référence : UNIT_FACTOR = 1e6).
+% Adapté aux ÉCHANTILLONS CYLINDRIQUES découpés en tranches de 90° :
+%   - crop automatique des bords (divergence capteur / bandes saturées)
+%   - suppression des artefacts linéaires verticaux + interpolation
+%   - lissage par filtre bilatéral (préserve les pics isolés)
 %
-% Options réglables dans la section CONFIG ci-dessous :
-%     - VMIN / VMAX : plage de la barre de couleur (en µm)
-%     - XLIM / YLIM : zoom manuel sur une zone (mêmes unités que les axes)
-%     - PIXEL_SIZE_MM : taille de pixel pour convertir les axes X/Y en mm
-%
-% Toutes ces options sont à [] par défaut (comportement automatique,
-% pas de zoom, échelle de couleur auto-calée sur les données).
-%
-% Au lancement, une fenêtre s'ouvre pour choisir le dossier d'entrée puis
-% le dossier de sortie (uigetdir), sauf si les chemins sont renseignés en
-% dur dans INPUT_FOLDER / OUTPUT_FOLDER.
-%
-% Nécessite l'Image Processing Toolbox (imresize).
+% Les données brutes des TIFF sont en MÈTRES -> converties en µm à l'affichage.
 %==========================================================================
 
-    %======================================================================
-    %                               CONFIG
-    %======================================================================
+    % =====================================================================
+    %                                CONFIG
+    % =====================================================================
 
-    % --- Dossiers --------------------------------------------------------
-    % Laisser vide ('') : une fenêtre s'ouvrira au lancement pour choisir
-    % le dossier d'entrée puis le dossier de sortie. Renseigner un chemin
-    % en dur permet de sauter la fenêtre correspondante (utile en automatisé).
-    cfg.INPUT_FOLDER  = '';          % ex : 'C:\Users\moi\Desktop\TIFF_a_traiter'
-    cfg.OUTPUT_FOLDER = '';          % ex : 'C:\Users\moi\Desktop\PNG_export'
-    cfg.RECURSIVE     = false;       % chercher aussi dans les sous-dossiers ?
+    cfg = struct();
 
-    % --- Unité des données brutes -----------------------------------------
-    cfg.UNIT_FACTOR = 1e6;           % m -> µm (mettre 1.0 si déjà en µm)
+    % --- Dossiers / fichiers --------------------------------------------
+    cfg.INPUT_FOLDER  = '';     % ex : 'C:\Users\moi\Desktop\TIFF_a_traiter'
+    cfg.INPUT_FILE    = '';     % Chemin d'un fichier unique (mode "single")
+    cfg.OUTPUT_FOLDER = '';     % ex : 'C:\Users\moi\Desktop\PNG_export'
+    cfg.RECURSIVE     = false;
+
+    % 'single', 'batch', ou '' => fenêtre de dialogue
+    cfg.PROCESS_MODE = '';
+
+    % --- Unité des données brutes ---------------------------------------
+    cfg.UNIT_FACTOR = 1e6;      % m -> µm
     cfg.UNIT_LABEL  = 'µm';
 
-    % --- Taille de pixel / dimensions physiques -----------------------------
-    % Utilisées pour afficher les axes X/Y en mm. Ordre de priorité :
-    %   1) cfg.PIXEL_SIZE_MM, si renseigné (mm/pixel, pixels carrés) ;
-    %   2) les métadonnées du TIFF (XResolution/ResolutionUnit), si présentes ;
-    %   3) SAMPLE_WIDTH_MM / SAMPLE_HEIGHT_MM (dimensions physiques totales
-    %      connues du champ scanné, appliquées à TOUS les fichiers du lot,
-    %      indépendamment du nombre de pixels de chacun) ;
-    %   4) à défaut, axes affichés en pixels (avertissement console).
-    cfg.PIXEL_SIZE_MM    = [];       % ex : 0.05
-    cfg.SAMPLE_WIDTH_MM  = [];       % ex : 34.96
-    cfg.SAMPLE_HEIGHT_MM = [];       % ex : 23.57
+    % --- Taille de pixel / dimensions physiques -------------------------
+    cfg.PIXEL_SIZE_MM    = [];
+    cfg.SAMPLE_WIDTH_MM  = 40.52;
+    cfg.SAMPLE_HEIGHT_MM = 27.28;
 
-    % --- Lissage / sur-échantillonnage (comme le script de référence) -------
-    % Sur-échantillonnage par interpolation bicubique (équivalent
-    % scipy.ndimage.zoom, order=3) avant affichage, pour un rendu lisse au
-    % lieu du grain brut pixel par pixel. Activé par défaut.
+    % --- Lissage / sur-échantillonnage ----------------------------------
     cfg.APPLY_SMOOTHING = true;
-    cfg.SMOOTH_FACTOR = 4;           % facteur de sur-échantillonnage
-    cfg.SMOOTH_METHOD = 'bicubic';   % équivalent order=3 de scipy.zoom
-    % Garde-fou : si (n_lignes*facteur) x (n_colonnes*facteur) dépasse ce
-    % nombre de pixels, le facteur est réduit automatiquement.
-    cfg.MAX_SMOOTHED_PIXELS = 40000000;
+    cfg.SMOOTH_FACTOR   = 4;
+    cfg.SMOOTH_ORDER    = 3;    % (info ; imresize bicubique)
+    cfg.MAX_SMOOTHED_PIXELS = 40e6;
 
-    % --- Plage de la colorbar, en µm ---------------------------------------
-    % [] = calage automatique (percentiles 1-99 des données).
-    cfg.VMIN = [];                   % ex : -100
-    cfg.VMAX = [];                   % ex : 100
+    % --- Plage de la barre de couleur (colorbar), en µm -----------------
+    cfg.VMIN = [];
+    cfg.VMAX = [];
 
-    % --- Zoom manuel (mêmes unités que les axes : mm si taille de pixel
-    %     connue, pixels sinon) ------------------------------------------
-    cfg.XLIM = [];                   % ex : [5 20]  -> axe horizontal (Y)
-    cfg.YLIM = [];                   % ex : [0 10]  -> axe vertical   (Z)
+    % --- Zoom manuel ----------------------------------------------------
+    cfg.XLIM = [];
+    cfg.YLIM = [];
 
-    % --- Colormaps -----------------------------------------------------------
-    cfg.CMAP_ROUGHNESS = jet(256);   % colormap divergente centrée sur 0
-    cfg.CMAP_ALIGNED   = jet(256);   % colormap séquentielle
+    % --- Colormaps ------------------------------------------------------
+    cfg.CMAP_ROUGHNESS = 'jet';
+    cfg.CMAP_ALIGNED   = 'jet';
 
-    % --- Colorbar -------------------------------------------------------------
-    cfg.COLORBAR_ORIENTATION = 'horizontal'; % 'horizontal' ou 'vertical'
+    % --- Colorbar -------------------------------------------------------
+    cfg.COLORBAR_ORIENTATION = 'horizontal';   % 'horizontal' ou 'vertical'
 
-    % --- Habillage des figures ------------------------------------------------
+    % --- Habillage des figures ------------------------------------------
     cfg.DPI = 200;
-
-    % Taille de figure : la plus grande dimension est fixée à
-    % TARGET_LONG_SIDE_INCHES, l'autre suit le ratio des données (aspect
-    % préservé), avec un minimum MIN_SHORT_SIDE_INCHES pour garder de la
-    % place aux titres/labels/colorbar.
     cfg.TARGET_LONG_SIDE_INCHES = 16.0;
     cfg.MIN_SHORT_SIDE_INCHES   = 9.0;
-    cfg.MAX_PIXELS_DIM          = 20000;
+    cfg.MAX_PIXELS_DIM = 20000;
 
-    % --- Tailles de police (points) --------------------------------------------
     cfg.TITLE_FONTSIZE      = 20;
     cfg.AXIS_LABEL_FONTSIZE = 16;
     cfg.TICK_FONTSIZE       = 14;
     cfg.CBAR_LABEL_FONTSIZE = 16;
     cfg.CBAR_TICK_FONTSIZE  = 14;
 
-    %======================================================================
+    % =====================================================================
     %                            FIN DE LA CONFIG
-    %======================================================================
+    % =====================================================================
 
-    main_run(cfg);
-end
-
-
-%% ------------------------------------------------------------------------
-function main_run(cfg)
-    [input_folder, output_folder] = resolve_folders(cfg);
-
-    fprintf('Lecture des fichiers .tif/.tiff dans : %s\n', input_folder);
-    tiff_files = find_tiff_files(input_folder, cfg.RECURSIVE);
-
+    [mode, tiff_files, output_folder] = resolve_inputs(cfg); %#ok<ASGLU>
     if isempty(tiff_files)
         fprintf('Aucun fichier .tif/.tiff trouvé.\n');
         return;
     end
 
-    fprintf('%d fichier(s) trouvé(s).\n\n', numel(tiff_files));
+    fprintf('%d fichier(s) à traiter.\n\n', numel(tiff_files));
 
-    n_ok = 0;
-    n_fail = 0;
+    n_ok = 0; n_fail = 0;
     for k = 1:numel(tiff_files)
         path = tiff_files{k};
+        [~, name, ext] = fileparts(path);
+        fprintf('--- Traitement de %s%s ---\n', name, ext);
         try
             out_path = plot_tiff_to_png(path, output_folder, cfg);
-            [~, name, ext] = fileparts(path);
-            file_type = detect_file_type([name ext]);
-            fprintf('[OK] %s%s  (type=%s)  -> %s\n', name, ext, file_type, out_path);
+            ftype = detect_file_type([name ext]);
+            fprintf('[OK] %s%s  (type=%s)  -> %s\n\n', name, ext, ftype, out_path);
             n_ok = n_ok + 1;
-        catch ME
-            [~, name, ext] = fileparts(path);
-            fprintf('[ERREUR] %s%s : %s\n', name, ext, ME.message);
-            disp(getReport(ME, 'extended', 'hyperlinks', 'off'));
+        catch e
+            fprintf('[ERREUR] %s%s : %s\n', name, ext, e.message);
+            fprintf('%s\n\n', getReport(e));
             n_fail = n_fail + 1;
         end
     end
 
-    fprintf('\nTerminé : %d succès, %d échec(s).\n', n_ok, n_fail);
+    fprintf('Terminé : %d succès, %d échec(s).\n', n_ok, n_fail);
     fprintf('PNG exportés dans : %s\n', output_folder);
 end
 
 
-%% ------------------------------------------------------------------------
-function [input_folder, output_folder] = resolve_folders(cfg)
-% Détermine le dossier d'entrée et le dossier de sortie : si renseignés en
-% dur dans cfg, on les utilise directement (pas de fenêtre) ; sinon, on
-% ouvre une fenêtre de sélection pour chacun.
+% =========================================================================
+%  Résolution des entrées
+% =========================================================================
 
-    input_folder = cfg.INPUT_FOLDER;
-    output_folder = cfg.OUTPUT_FOLDER;
-
-    if isempty(input_folder)
-        input_folder = uigetdir(pwd, 'Sélectionner le dossier contenant les fichiers TIFF');
-        if isequal(input_folder, 0)
-            error('Aucun dossier d''entrée sélectionné. Arrêt.');
-        end
+function [mode, tiff_files, output_folder] = resolve_inputs(cfg)
+    mode = cfg.PROCESS_MODE;
+    if isempty(mode) && ~isempty(cfg.INPUT_FILE)
+        mode = 'single';
+    end
+    if isempty(mode)
+        mode = ask_mode();
+    end
+    if ~ismember(mode, {'single','batch'})
+        fprintf('Aucun mode sélectionné. Arrêt.\n');
+        error('Aucun mode sélectionné.');
     end
 
-    if isempty(output_folder)
-        output_folder = uigetdir(pwd, 'Sélectionner le dossier de destination des PNG');
-        if isequal(output_folder, 0)
-            error('Aucun dossier de sortie sélectionné. Arrêt.');
+    if strcmp(mode, 'single')
+        if ~isempty(cfg.INPUT_FILE)
+            path = cfg.INPUT_FILE;
+        else
+            path = select_file('Sélectionner le fichier TIFF à traiter');
         end
+        if isempty(path)
+            fprintf('Aucun fichier sélectionné. Arrêt.\n');
+            error('Aucun fichier sélectionné.');
+        end
+        fprintf('Mode : image unique -> %s\n', path);
+        tiff_files = {path};
+    else
+        if ~isempty(cfg.INPUT_FOLDER)
+            input_folder = cfg.INPUT_FOLDER;
+        else
+            input_folder = select_folder( ...
+                'Sélectionner le dossier contenant les fichiers TIFF');
+        end
+        if isempty(input_folder)
+            fprintf('Aucun dossier d''entrée sélectionné. Arrêt.\n');
+            error('Aucun dossier d''entrée sélectionné.');
+        end
+        fprintf('Mode : batch -> lecture des .tif/.tiff dans : %s\n', input_folder);
+        tiff_files = find_tiff_files(input_folder, cfg.RECURSIVE);
+    end
+
+    if ~isempty(cfg.OUTPUT_FOLDER)
+        output_folder = cfg.OUTPUT_FOLDER;
+    else
+        output_folder = select_folder('Sélectionner le dossier de destination des PNG');
+    end
+    if isempty(output_folder)
+        fprintf('Aucun dossier de sortie sélectionné. Arrêt.\n');
+        error('Aucun dossier de sortie sélectionné.');
     end
 end
 
 
-%% ------------------------------------------------------------------------
-function file_type = detect_file_type(filename)
-% Détecte le type de fichier : 'roughness', 'aligned', ou 'unknown'.
+function folder = select_folder(title_str)
+    folder = uigetdir(pwd, title_str);
+    if isequal(folder, 0)
+        folder = '';
+    end
+end
+
+
+function path = select_file(title_str)
+    [file, folder] = uigetfile( ...
+        {'*.tif;*.tiff;*.TIF;*.TIFF','Fichiers TIFF'; '*.*','Tous les fichiers'}, ...
+        title_str);
+    if isequal(file, 0)
+        path = '';
+    else
+        path = fullfile(folder, file);
+    end
+end
+
+
+function mode = ask_mode()
+    mode = '';
+    fig = uifigure('Name','Mode de traitement', ...
+                   'Position',[500 400 460 200]);
+    fig.WindowStyle = 'modal';
+
+    uilabel(fig, 'Text','Que souhaitez-vous traiter ?', ...
+        'FontWeight','bold','FontSize',14, ...
+        'Position',[30 140 400 30]);
+
+    uibutton(fig, 'Text','Une seule image', ...
+        'Position',[50 50 160 60], 'FontSize',13, ...
+        'ButtonPushedFcn', @(~,~) pick('single'));
+
+    uibutton(fig, 'Text','Batch (tout un dossier)', ...
+        'Position',[240 50 180 60], 'FontSize',13, ...
+        'ButtonPushedFcn', @(~,~) pick('batch'));
+
+    uiwait(fig);
+
+    function pick(v)
+        mode = v;
+        delete(fig);
+    end
+end
+
+
+% =========================================================================
+%  Détection de type et chargement
+% =========================================================================
+
+function ftype = detect_file_type(filename)
     name_lower = lower(filename);
     if contains(name_lower, 'roughness') || contains(name_lower, 'rugosit')
-        file_type = 'roughness';
+        ftype = 'roughness';
     elseif contains(name_lower, 'aligned')
-        file_type = 'aligned';
+        ftype = 'aligned';
     else
-        file_type = 'unknown';
+        ftype = 'unknown';
     end
 end
 
 
-%% ------------------------------------------------------------------------
 function arr = load_tiff(path, cfg)
-% Charge un fichier .tif/.tiff en tableau 2D double, en mètres -> convertit
-% selon UNIT_FACTOR.
     arr = imread(path);
     arr = double(arr);
-
     if ndims(arr) == 3
-        arr = arr(:, :, 1);   % image multi-canaux -> on garde le 1er canal
+        arr = arr(:,:,1);
     end
-
     arr = arr * cfg.UNIT_FACTOR;
 end
 
 
-%% ------------------------------------------------------------------------
-function arr_out = smooth_upsample(arr, cfg)
-% Sur-échantillonne arr par interpolation bicubique (comme le script de
-% référence : scipy.ndimage.zoom, order=3), pour un rendu lisse au lieu du
-% grain brut pixel par pixel. Le facteur est réduit automatiquement si le
-% résultat dépasserait MAX_SMOOTHED_PIXELS.
+% =========================================================================
+%  Lissage / sur-échantillonnage
+% =========================================================================
+
+function arr = smooth_upsample(arr, cfg)
     if ~cfg.APPLY_SMOOTHING
-        arr_out = arr;
         return;
     end
 
-    % Gestion des NaN avant interpolation (comme le script de référence)
     if any(isnan(arr(:)))
-        mean_val = mean(arr(~isnan(arr)));
+        mean_val = mean(arr(:), 'omitnan');
         arr(isnan(arr)) = mean_val;
     end
 
@@ -222,131 +254,128 @@ function arr_out = smooth_upsample(arr, cfg)
     if total_pixels > cfg.MAX_SMOOTHED_PIXELS
         max_factor_sq = cfg.MAX_SMOOTHED_PIXELS / (n_rows * n_cols);
         factor = max(1.0, sqrt(max_factor_sq));
-        fprintf('  [i] Facteur de lissage réduit automatiquement à %.2f (image %dx%d trop grande pour x%g).\n', ...
-            factor, n_cols, n_rows, cfg.SMOOTH_FACTOR);
+        fprintf('  [i] Facteur de lissage réduit automatiquement à %.2f ', factor);
+        fprintf('(image %dx%d trop grande pour x%d).\n', ...
+            n_cols, n_rows, cfg.SMOOTH_FACTOR);
     end
 
     if factor <= 1
-        arr_out = arr;
         return;
     end
 
-    arr_out = imresize(arr, factor, cfg.SMOOTH_METHOD);
+    new_size = [round(n_rows*factor), round(n_cols*factor)];
+    arr = imresize(arr, new_size, 'bicubic');
 end
 
 
-%% ------------------------------------------------------------------------
+% =========================================================================
+%  Taille de pixel / extent
+% =========================================================================
+
 function pixel_size_mm = get_pixel_size_from_metadata(path)
-% Essaie de lire la taille de pixel (en mm) depuis les tags TIFF standards
-% (XResolution + ResolutionUnit). Retourne [] si l'info n'est pas présente
-% ou pas exploitable.
     pixel_size_mm = [];
     try
         info = imfinfo(path);
-        info = info(1);
+        if isfield(info, 'XResolution') && ~isempty(info.XResolution)
+            x_res = info.XResolution;
+            if iscell(x_res), x_res = x_res{1}; end
+            if isnumeric(x_res) && numel(x_res) == 2
+                pixels_per_unit = x_res(1) / x_res(2);
+            else
+                pixels_per_unit = double(x_res);
+            end
 
-        if ~isfield(info, 'XResolution') || isempty(info.XResolution) || info.XResolution == 0
-            return;
+            if ~pixels_per_unit || pixels_per_unit <= 0
+                return;
+            end
+
+            unit_code = 2;
+            if isfield(info, 'ResolutionUnit')
+                unit_code = info.ResolutionUnit;
+            end
+
+            if ischar(unit_code) || isstring(unit_code)
+                switch lower(char(unit_code))
+                    case 'inch',       mm_per_unit = 25.4;
+                    case 'centimeter', mm_per_unit = 10.0;
+                    otherwise,         return;
+                end
+            else
+                switch unit_code
+                    case 2, mm_per_unit = 25.4;
+                    case 3, mm_per_unit = 10.0;
+                    otherwise, return;
+                end
+            end
+
+            pixel_size_mm = mm_per_unit / pixels_per_unit;
         end
-        pixels_per_unit = info.XResolution;
-
-        if isfield(info, 'ResolutionUnit')
-            unit_str = lower(info.ResolutionUnit);
-        else
-            unit_str = 'inch';   % 2 = inch par défaut, comme le script Python
-        end
-
-        if contains(unit_str, 'inch')
-            mm_per_unit = 25.4;
-        elseif contains(unit_str, 'centimeter') || contains(unit_str, 'cm')
-            mm_per_unit = 10.0;
-        else
-            return;   % unité "None" ou inconnue
-        end
-
-        pixel_size_mm = mm_per_unit / pixels_per_unit;
     catch
         pixel_size_mm = [];
     end
 end
 
 
-%% ------------------------------------------------------------------------
-function pixel_size_mm = resolve_pixel_size_mm(path, cfg)
-% Détermine la taille de pixel en mm à utiliser pour ce fichier.
+function ps = resolve_pixel_size_mm(path, cfg)
     if ~isempty(cfg.PIXEL_SIZE_MM)
-        pixel_size_mm = cfg.PIXEL_SIZE_MM;
+        ps = cfg.PIXEL_SIZE_MM;
         return;
     end
-
-    pixel_size_mm = get_pixel_size_from_metadata(path);
+    ps = get_pixel_size_from_metadata(path);
 end
 
 
-%% ------------------------------------------------------------------------
 function [extent, is_mm] = resolve_extent(path, arr, cfg)
-% Détermine l'extent [xmin xmax ymin ymax] (convention Python : ymin est en
-% bas, ymax=0 en haut, axe Y "inversé") à utiliser pour l'affichage, et si
-% les axes doivent être en mm ou en pixels.
-% Ordre de priorité : PIXEL_SIZE_MM -> métadonnées TIFF ->
-% SAMPLE_WIDTH_MM/SAMPLE_HEIGHT_MM -> pixels (avec avertissement).
     [n_rows, n_cols] = size(arr);
 
-    pixel_size_mm = resolve_pixel_size_mm(path, cfg);
-    if ~isempty(pixel_size_mm)
-        extent = [0, n_cols * pixel_size_mm, n_rows * pixel_size_mm, 0];
+    ps = resolve_pixel_size_mm(path, cfg);
+    if ~isempty(ps)
+        extent = [0, n_cols*ps, n_rows*ps, 0];
         is_mm = true;
         return;
     end
 
     if ~isempty(cfg.SAMPLE_WIDTH_MM) && ~isempty(cfg.SAMPLE_HEIGHT_MM)
-        % Dimensions physiques totales connues, appliquées telles quelles,
-        % indépendamment du nombre de pixels.
         extent = [0, cfg.SAMPLE_WIDTH_MM, cfg.SAMPLE_HEIGHT_MM, 0];
         is_mm = true;
         return;
     end
 
     [~, name, ext] = fileparts(path);
-    fprintf(['  [!] Taille de pixel introuvable (ni PIXEL_SIZE_MM, ni métadonnées, ' ...
-        'ni SAMPLE_WIDTH_MM/SAMPLE_HEIGHT_MM) pour %s%s -> axes affichés en pixels.\n'], name, ext);
+    fprintf('  [!] Taille de pixel introuvable pour %s%s -> axes affichés en pixels.\n', ...
+        name, ext);
     extent = [0, n_cols, n_rows, 0];
     is_mm = false;
 end
 
 
-%% ------------------------------------------------------------------------
+% =========================================================================
+%  Figure : taille, DPI, vrange
+% =========================================================================
+
 function figsize = compute_figsize(extent, cfg)
-% Calcule une taille de figure [largeur hauteur] en pouces en respectant le
-% ratio largeur/hauteur des données (aspect préservé, pas de déformation),
-% MAIS mise à l'échelle pour que la plus grande dimension soit
-% TARGET_LONG_SIDE_INCHES.
-%
-% - La plus grande dimension est fixée à TARGET_LONG_SIDE_INCHES.
-% - L'autre dimension suit le ratio, mais reste >= MIN_SHORT_SIDE_INCHES
-%   pour garder de la place aux titres/labels/colorbar.
     x_span = abs(extent(2) - extent(1));
     y_span = abs(extent(3) - extent(4));
-
     if x_span == 0 || y_span == 0
-        figsize = [cfg.TARGET_LONG_SIDE_INCHES, cfg.TARGET_LONG_SIDE_INCHES * 3 / 4];
+        figsize = [cfg.TARGET_LONG_SIDE_INCHES, ...
+                   cfg.TARGET_LONG_SIDE_INCHES*3/4];
         return;
     end
 
-    ratio = x_span / y_span;   % > 1 si plus large que haut
+    ratio = x_span / y_span;
 
     if ratio >= 1
-        width = cfg.TARGET_LONG_SIDE_INCHES;
+        width  = cfg.TARGET_LONG_SIDE_INCHES;
         height = width / ratio;
         if height < cfg.MIN_SHORT_SIDE_INCHES
             height = cfg.MIN_SHORT_SIDE_INCHES;
-            width = height * ratio;
+            width  = height * ratio;
         end
     else
         height = cfg.TARGET_LONG_SIDE_INCHES;
-        width = height * ratio;
+        width  = height * ratio;
         if width < cfg.MIN_SHORT_SIDE_INCHES
-            width = cfg.MIN_SHORT_SIDE_INCHES;
+            width  = cfg.MIN_SHORT_SIDE_INCHES;
             height = width / ratio;
         end
     end
@@ -355,11 +384,7 @@ function figsize = compute_figsize(extent, cfg)
 end
 
 
-%% ------------------------------------------------------------------------
 function dpi = get_effective_dpi(figsize, cfg)
-% Réduit le DPI si nécessaire pour que la plus grande dimension du PNG
-% final ne dépasse pas MAX_PIXELS_DIM pixels (évite des fichiers énormes
-% sur les échantillons très allongés).
     largest_inches = max(figsize);
     dpi = cfg.DPI;
     if largest_inches * dpi > cfg.MAX_PIXELS_DIM
@@ -368,104 +393,76 @@ function dpi = get_effective_dpi(figsize, cfg)
 end
 
 
-%% ------------------------------------------------------------------------
 function [vmin, vmax] = get_vrange(arr, cfg)
-% Retourne (vmin, vmax) à utiliser pour la colorbar, en µm.
-    valid = arr(~isnan(arr));
-    if isempty(cfg.VMIN)
-        vmin = prctile(valid, 1);
-    else
+    if ~isempty(cfg.VMIN)
         vmin = cfg.VMIN;
-    end
-    if isempty(cfg.VMAX)
-        vmax = prctile(valid, 99);
     else
+        vmin = prctile(arr(:), 1);
+    end
+    if ~isempty(cfg.VMAX)
         vmax = cfg.VMAX;
+    else
+        vmax = prctile(arr(:), 99);
     end
 end
 
 
-%% ------------------------------------------------------------------------
-function norm_data = two_slope_normalize(arr, vmin, vcenter, vmax)
-% Équivalent de matplotlib.colors.TwoSlopeNorm(vmin, vcenter, vmax) :
-% mappe [vmin, vcenter] -> [0, 0.5] et [vcenter, vmax] -> [0.5, 1],
-% linéairement de part et d'autre, pour centrer la colormap sur vcenter
-% (typiquement 0) même si vmin/vmax ne sont pas symétriques.
-    norm_data = zeros(size(arr));
+% =========================================================================
+%  Rendu + export
+% =========================================================================
 
-    below = arr <= vcenter;
-    above = ~below;
-
-    if vcenter > vmin
-        norm_data(below) = 0.5 * (arr(below) - vmin) / (vcenter - vmin);
-    else
-        norm_data(below) = 0.5;
-    end
-
-    if vmax > vcenter
-        norm_data(above) = 0.5 + 0.5 * (arr(above) - vcenter) / (vmax - vcenter);
-    else
-        norm_data(above) = 0.5;
-    end
-
-    norm_data = min(max(norm_data, 0), 1);
-end
-
-
-%% ------------------------------------------------------------------------
 function out_path = plot_tiff_to_png(tiff_path, output_folder, cfg)
-% Lit un fichier tiff, le visualise selon son type, exporte en PNG.
     [~, base_name, ext] = fileparts(tiff_path);
-    file_type = detect_file_type([base_name ext]);
+    filename = [base_name ext];
+    file_type = detect_file_type(filename);
 
     arr = load_tiff(tiff_path, cfg);
     [extent, is_mm] = resolve_extent(tiff_path, arr, cfg);
     [vmin, vmax] = get_vrange(arr, cfg);
     arr_plot = smooth_upsample(arr, cfg);
-
     figsize = compute_figsize(extent, cfg);
     effective_dpi = get_effective_dpi(figsize, cfg);
 
-    fig = figure('Units', 'inches', 'Position', [1 1 figsize(1) figsize(2)], ...
-        'Color', 'w', 'Visible', 'off');
-    ax = axes('Parent', fig);
-    hold(ax, 'on');
+    fig = figure('Visible','off', 'Units','inches', ...
+        'Position',[1 1 figsize(1) figsize(2)], ...
+        'PaperPositionMode','auto', ...
+        'Color','w');
 
-    x_data = [extent(1), extent(2)];
-    y_data = [extent(4), extent(3)];   % extent(4)=0 (haut), extent(3)=bas
-
-    use_two_slope = strcmp(file_type, 'roughness') && vmin < 0 && vmax > 0;
+    ax = axes('Parent', fig); %#ok<LAXES>
 
     switch file_type
         case 'roughness'
-            cmap = cfg.CMAP_ROUGHNESS;
+            % Colorbar divergente centrée sur 0 si vmin<0<vmax
+            if vmin < 0 && vmax > 0
+                max_abs = max(abs(vmin), abs(vmax));
+                imagesc(ax, arr_plot, [-max_abs, max_abs]);
+            else
+                imagesc(ax, arr_plot, [vmin vmax]);
+            end
+            colormap(ax, cfg.CMAP_ROUGHNESS);
             cbar_label = sprintf('Rugosité (%s)', cfg.UNIT_LABEL);
-            title_str = sprintf('%s - Surface roughness map (vue de dessus)', base_name);
+            title_str  = sprintf('%s - Surface roughness map (vue de dessus)', ...
+                base_name);
+
         case 'aligned'
-            cmap = cfg.CMAP_ALIGNED;
+            imagesc(ax, arr_plot, [vmin vmax]);
+            colormap(ax, cfg.CMAP_ALIGNED);
             cbar_label = sprintf('Hauteur (%s)', cfg.UNIT_LABEL);
-            title_str = sprintf('%s - Aligned surface map (vue de dessus)', base_name);
+            title_str  = sprintf('%s - Aligned surface map (vue de dessus)', ...
+                base_name);
+
         otherwise
-            cmap = jet(256);
+            imagesc(ax, arr_plot, [vmin vmax]);
+            colormap(ax, 'jet');
             cbar_label = sprintf('Valeur (%s)', cfg.UNIT_LABEL);
-            title_str = sprintf('%s (type non reconnu)', base_name);
+            title_str  = sprintf('%s (type non reconnu)', base_name);
     end
 
-    if use_two_slope
-        % Colormap divergente centrée sur 0 (équivalent TwoSlopeNorm)
-        norm_data = two_slope_normalize(arr_plot, vmin, 0, vmax);
-        imagesc(ax, x_data, y_data, norm_data);
-        clim(ax, [0 1]);
-        colormap(ax, cmap);
-    else
-        imagesc(ax, x_data, y_data, arr_plot);
-        clim(ax, [vmin vmax]);
-        colormap(ax, cmap);
-    end
+    axis(ax, 'image');
+    set(ax, 'YDir', 'reverse');
 
-    set(ax, 'YDir', 'reverse');   % origine en haut, comme imshow (origin='upper')
-    axis(ax, 'equal');
-    axis(ax, 'tight');
+    xlim(ax, [extent(1), extent(2)]);
+    ylim(ax, [extent(3), extent(4)]);
 
     % --- axes ---
     if is_mm
@@ -476,8 +473,7 @@ function out_path = plot_tiff_to_png(tiff_path, output_folder, cfg)
         ylabel(ax, 'Z (px)', 'FontSize', cfg.AXIS_LABEL_FONTSIZE);
     end
 
-    title(ax, title_str, 'FontSize', cfg.TITLE_FONTSIZE, 'FontWeight', 'bold', ...
-        'Interpreter', 'none');
+    title(ax, title_str, 'FontSize', cfg.TITLE_FONTSIZE, 'FontWeight','bold');
     set(ax, 'FontSize', cfg.TICK_FONTSIZE);
 
     % --- zoom manuel ---
@@ -485,44 +481,36 @@ function out_path = plot_tiff_to_png(tiff_path, output_folder, cfg)
         xlim(ax, cfg.XLIM);
     end
     if ~isempty(cfg.YLIM)
-        % l'axe Y est inversé (origine en haut) -> ylim prend juste
-        % [min max], YDir='reverse' se charge de l'affichage.
-        ylim(ax, sort(cfg.YLIM));
+        ylim(ax, [max(cfg.YLIM), min(cfg.YLIM)]);
     end
 
     % --- colorbar ---
-    if strcmpi(cfg.COLORBAR_ORIENTATION, 'horizontal')
-        cb = colorbar(ax, 'southoutside');
-    else
-        cb = colorbar(ax, 'eastoutside');
-    end
-    cb.Label.String = cbar_label;
+    cb = colorbar(ax, 'Location', cfg.COLORBAR_ORIENTATION);
+    cb.Label.String   = cbar_label;
     cb.Label.FontSize = cfg.CBAR_LABEL_FONTSIZE;
-    cb.FontSize = cfg.CBAR_TICK_FONTSIZE;
+    cb.FontSize       = cfg.CBAR_TICK_FONTSIZE;
 
-    if use_two_slope
-        % La colorbar est en échelle normalisée [0,1] : on ré-étiquette les
-        % graduations avec les vraies valeurs (µm) pour rester lisible.
-        tick_vals = [vmin, vmin/2, 0, vmax/2, vmax];
-        tick_pos = two_slope_normalize(tick_vals, vmin, 0, vmax);
-        cb.Ticks = tick_pos;
-        cb.TickLabels = arrayfun(@(v) sprintf('%.3g', v), tick_vals, 'UniformOutput', false);
-    end
-
-    % --- export ---
+    % --- export PNG ---
     if ~exist(output_folder, 'dir')
         mkdir(output_folder);
     end
     out_path = fullfile(output_folder, [base_name '.png']);
 
-    exportgraphics(fig, out_path, 'Resolution', round(effective_dpi));
+    try
+        exportgraphics(fig, out_path, 'Resolution', effective_dpi);
+    catch
+        print(fig, out_path, '-dpng', sprintf('-r%d', round(effective_dpi)));
+    end
     close(fig);
 end
 
 
-%% ------------------------------------------------------------------------
+% =========================================================================
+%  Recherche des fichiers TIFF
+% =========================================================================
+
 function files = find_tiff_files(input_folder, recursive)
-    patterns = {'*.tif', '*.tiff', '*.TIF', '*.TIFF'};
+    patterns = {'*.tif','*.tiff','*.TIF','*.TIFF'};
     files = {};
     for p = 1:numel(patterns)
         if recursive
@@ -531,9 +519,7 @@ function files = find_tiff_files(input_folder, recursive)
             d = dir(fullfile(input_folder, patterns{p}));
         end
         for k = 1:numel(d)
-            if ~d(k).isdir
-                files{end+1} = fullfile(d(k).folder, d(k).name); %#ok<AGROW>
-            end
+            files{end+1} = fullfile(d(k).folder, d(k).name); %#ok<AGROW>
         end
     end
     files = unique(files);
