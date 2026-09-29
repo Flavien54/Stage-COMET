@@ -4,8 +4,9 @@
 =============================================================================
  tiff_to_png.py
 -----------------------------------------------------------------------------
- Lit tous les fichiers .tif / .tiff d'un dossier, les visualise (heatmap)
- selon leur type détecté à partir du nom de fichier, puis exporte en PNG.
+ Lit un fichier .tif / .tiff (mode "single") ou tous les fichiers d'un
+ dossier (mode "batch"), les visualise (heatmap) selon leur type détecté à
+ partir du nom de fichier, puis exporte en PNG.
 
  Adapté aux ÉCHANTILLONS CYLINDRIQUES découpés en tranches de 90° :
    - crop automatique des bords (divergence capteur / bandes saturées)
@@ -54,8 +55,13 @@ except ImportError:
 # =============================================================================
 
 INPUT_FOLDER = None
+INPUT_FILE = None          # Chemin d'un fichier unique (mode "single")
 OUTPUT_FOLDER = None
 RECURSIVE = False
+
+# "single" (une seule image), "batch" (tout un dossier)
+# ou None => une fenêtre demande le mode à chaque lancement.
+PROCESS_MODE = None
 
 UNIT_FACTOR = 1e6
 UNIT_LABEL = "µm"
@@ -153,8 +159,8 @@ YLIM = (0.5, 2.7)
 # sont étirées pour la remplir : plus aucune zone blanche.
 FILL_AXES_LIMITS = True
 
-CMAP_ROUGHNESS = "jet"
-CMAP_ALIGNED = "jet"
+CMAP_ROUGHNESS = "viridis"
+CMAP_ALIGNED = "viridis"
 
 COLORBAR_ORIENTATION = "horizontal"
 
@@ -184,23 +190,87 @@ def select_folder(title: str) -> str:
     return folder
 
 
-def resolve_folders():
-    input_folder = INPUT_FOLDER
-    output_folder = OUTPUT_FOLDER
+def select_file(title: str) -> str:
+    """Boîte de dialogue pour choisir un seul fichier TIFF."""
+    root = Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askopenfilename(
+        title=title,
+        filetypes=[("Fichiers TIFF", "*.tif *.tiff *.TIF *.TIFF"),
+                   ("Tous les fichiers", "*.*")],
+    )
+    root.destroy()
+    return path
 
-    if not input_folder:
-        input_folder = select_folder("Sélectionner le dossier contenant les fichiers TIFF")
+
+def ask_mode() -> str:
+    """Petite fenêtre : une seule image ou batch. Retourne 'single', 'batch' ou None."""
+    from tkinter import Label, Button, Frame
+
+    root = Tk()
+    root.title("Mode de traitement")
+    root.attributes("-topmost", True)
+    root.resizable(False, False)
+    choice = {"value": None}
+
+    def pick(value):
+        choice["value"] = value
+        root.destroy()
+
+    Label(root, text="Que souhaitez-vous traiter ?",
+          font=("Arial", 12, "bold"), padx=20, pady=15).pack()
+
+    frame = Frame(root, padx=20, pady=10)
+    frame.pack()
+    Button(frame, text="Une seule image", width=20, height=2,
+           command=lambda: pick("single")).grid(row=0, column=0, padx=8)
+    Button(frame, text="Batch (tout un dossier)", width=20, height=2,
+           command=lambda: pick("batch")).grid(row=0, column=1, padx=8)
+
+    root.protocol("WM_DELETE_WINDOW", lambda: pick(None))
+    root.mainloop()
+    return choice["value"]
+
+
+def resolve_inputs():
+    """
+    Retourne (mode, tiff_files, output_folder).
+      - mode 'single' : tiff_files contient un seul fichier
+      - mode 'batch'  : tiff_files contient tous les TIFF du dossier
+    """
+    mode = PROCESS_MODE
+    if mode is None and INPUT_FILE:
+        mode = "single"            # un fichier est déjà fixé dans la config
+    if mode is None:
+        mode = ask_mode()
+    if mode not in ("single", "batch"):
+        print("Aucun mode sélectionné. Arrêt.")
+        raise SystemExit
+
+    if mode == "single":
+        path = INPUT_FILE or select_file("Sélectionner le fichier TIFF à traiter")
+        if not path:
+            print("Aucun fichier sélectionné. Arrêt.")
+            raise SystemExit
+        print(f"Mode : image unique -> {path}")
+        tiff_files = [path]
+    else:
+        input_folder = INPUT_FOLDER or select_folder(
+            "Sélectionner le dossier contenant les fichiers TIFF")
         if not input_folder:
             print("Aucun dossier d'entrée sélectionné. Arrêt.")
             raise SystemExit
+        print(f"Mode : batch -> lecture des .tif/.tiff dans : {input_folder}")
+        tiff_files = find_tiff_files(input_folder, RECURSIVE)
 
+    output_folder = OUTPUT_FOLDER or select_folder(
+        "Sélectionner le dossier de destination des PNG")
     if not output_folder:
-        output_folder = select_folder("Sélectionner le dossier de destination des PNG")
-        if not output_folder:
-            print("Aucun dossier de sortie sélectionné. Arrêt.")
-            raise SystemExit
+        print("Aucun dossier de sortie sélectionné. Arrêt.")
+        raise SystemExit
 
-    return input_folder, output_folder
+    return mode, tiff_files, output_folder
 
 
 def detect_file_type(filename: str) -> str:
@@ -861,16 +931,13 @@ def find_tiff_files(input_folder: str, recursive: bool = False):
 
 
 def main():
-    input_folder, output_folder = resolve_folders()
-
-    print(f"Lecture des fichiers .tif/.tiff dans : {input_folder}")
-    tiff_files = find_tiff_files(input_folder, RECURSIVE)
+    mode, tiff_files, output_folder = resolve_inputs()
 
     if not tiff_files:
         print("Aucun fichier .tif/.tiff trouvé.")
         return
 
-    print(f"{len(tiff_files)} fichier(s) trouvé(s).\n")
+    print(f"{len(tiff_files)} fichier(s) à traiter.\n")
 
     n_ok, n_fail = 0, 0
     for path in tiff_files:
